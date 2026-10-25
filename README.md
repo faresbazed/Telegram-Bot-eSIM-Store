@@ -44,8 +44,8 @@
 
 1. **انسخ المستودع من GitHub إلى الخادم الخاص بك:**
    ```bash
-   git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
-   cd YOUR_REPO_NAME
+   git clone https://github.com/faresbazed/Telegram-Bot-eSIM-Store
+   cd Telegram-Bot-eSIM-Store
    ```
 
 2. **شغّل سكربت التثبيت التفاعلي:**
