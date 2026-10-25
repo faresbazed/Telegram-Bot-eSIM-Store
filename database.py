@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import sqlite3
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -75,6 +76,8 @@ def init_db() -> None:
             );
             """
         )
+        # Clean up any corrupted mojibake values from previous runs
+        conn.execute("DELETE FROM settings WHERE value LIKE '%\u00d8%' OR value LIKE '%\u00d9%' OR value LIKE '%\u00f0%';")
         # Seed default settings from config/.env if not present
         default_settings = {
             "support_username": SUPPORT_USERNAME,
@@ -144,7 +147,7 @@ def set_user_ban(user_id: int, banned: bool) -> bool:
         )
         if cur.rowcount == 0 and banned:
             conn.execute(
-                "INSERT INTO users (user_id, username, full_name, is_banned) VALUES (?, '', 'ÙØ³ØªØ®Ø¯Ù ÙØ­Ø¸ÙØ±', 1)",
+                "INSERT INTO users (user_id, username, full_name, is_banned) VALUES (?, '', '\u0645\u0633\u062a\u062e\u062f\u0645 \u0645\u062d\u0638\u0648\u0631', 1)",
                 (user_id,),
             )
             conn.commit()
