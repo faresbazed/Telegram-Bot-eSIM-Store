@@ -12,6 +12,8 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
     InputFile,
 )
 from telegram.constants import ParseMode
@@ -42,6 +44,114 @@ NONE_STR = "\u0644\u0627 \u064a\u0648\u062c\u062f"
 NO_USER = "\u0628\u062f\u0648\u0646"
 ATTACHED_RECEIPT = "\u0645\u0631\u0641\u0642 \u0635\u0648\u0631\u0629 \u0625\u064a\u0635\u0627\u0644"
 
+
+
+# ==============================================================================
+# UI v2 - Button styles, welcome card & bottom reply menu
+# ==============================================================================
+# Telegram Bot API 9.4 button styles (needs python-telegram-bot >= 22.7):
+#   "success" = green, "primary" = blue, "danger" = red.
+# styled_markup() recolours every inline keyboard centrally inside
+# safe_edit_or_send(), so all existing screens get the new look without
+# editing each keyboard by hand. Dynamic list rows stay neutral (no style).
+
+STYLE_SUCCESS = "success"
+STYLE_PRIMARY = "primary"
+STYLE_DANGER = "danger"
+
+# Bottom reply-menu labels (message_router matches these texts exactly)
+MENU_SHOP = "\U0001f6d2 \u062a\u0635\u0641\u062d \u0627\u0644\u0645\u062a\u062c\u0631"
+MENU_TOPUP = "\U0001f4b3 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f"
+MENU_ORDERS = "\U0001f4e6 \u0637\u0644\u0628\u0627\u062a\u064a"
+MENU_BALANCE = "\U0001f4b0 \u0631\u0635\u064a\u062f\u064a"
+MENU_PROFILE = "\U0001f464 \u0645\u0644\u0641\u064a"
+MENU_SUPPORT = "\U0001f6df \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a"
+MENU_HOME = "\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629"
+MENU_ADMIN = "\U0001f6e0 \u0644\u0648\u062d\u0629 \u0627\u0644\u062a\u062d\u0643\u0645"
+
+_PRIMARY_NAV = (
+    "home", "adm_home", "u_account", "u_topup", "u_purchases", "u_support",
+    "adm_settings", "adm_topups_menu", "adm_users_menu", "adm_broadcast_start",
+    "adm_countries",
+)
+
+
+def _button_style(btn: InlineKeyboardButton) -> Optional[str]:
+    data = btn.callback_data or ""
+    text = btn.text or ""
+    if btn.url:
+        return STYLE_PRIMARY
+    if "unban" in data:
+        return STYLE_SUCCESS
+    # Red: destructive actions (checked by callback first, before nav/text)
+    if "_del" in data or data.startswith("adm_topup_no") or "ban" in data:
+        return STYLE_DANGER
+    # Blue: known main-navigation callbacks
+    if data in _PRIMARY_NAV or data.startswith("u_topup_m:") or "SelectCountry" in data:
+        return STYLE_PRIMARY
+    if any(w in text for w in ("\u062d\u0630\u0641", "\u0631\u0641\u0636", "\u062d\u0638\u0631", "\u0625\u0644\u063a\u0627\u0621")):
+        return STYLE_DANGER
+    # Green: buying / confirming / adding
+    if (
+        data == "u_countries"
+        or data.startswith(("u_country:", "u_plan:", "u_buy_confirm:", "adm_topup_ok"))
+        or "_add" in data
+        or any(w in text for w in ("\u0634\u0631\u0627\u0621", "\u062a\u0635\u0641\u062d", "\u0625\u0636\u0627\u0641\u0629"))
+    ):
+        return STYLE_SUCCESS
+    # Blue: back / home navigation by label
+    if any(w in text for w in ("\u0631\u062c\u0648\u0639", "\u0639\u0648\u062f\u0629", "\u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", "\u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645")):
+        return STYLE_PRIMARY
+    return None
+
+
+def styled_markup(markup):
+    """Return a copy of an InlineKeyboardMarkup with Bot API styles applied.
+
+    PTB button objects are immutable, so styled buttons are rebuilt.
+    Buttons in this bot only ever use text + callback_data or text + url.
+    """
+    if not isinstance(markup, InlineKeyboardMarkup):
+        return markup
+    rows = []
+    for row in markup.inline_keyboard:
+        new_row = []
+        for b in row:
+            style = _button_style(b)
+            if style is None:
+                new_row.append(b)
+            elif b.url:
+                new_row.append(InlineKeyboardButton(text=b.text, url=b.url, style=style))
+            else:
+                new_row.append(InlineKeyboardButton(text=b.text, callback_data=b.callback_data, style=style))
+        rows.append(new_row)
+    return InlineKeyboardMarkup(rows)
+
+
+def build_reply_menu(user_id: int) -> ReplyKeyboardMarkup:
+    """Persistent bottom menu (Su Store style), existing features only."""
+    rows = [
+        [KeyboardButton(MENU_SHOP, style=STYLE_SUCCESS), KeyboardButton(MENU_TOPUP)],
+        [KeyboardButton(MENU_ORDERS), KeyboardButton(MENU_BALANCE)],
+        [KeyboardButton(MENU_PROFILE), KeyboardButton(MENU_SUPPORT)],
+        [KeyboardButton(MENU_HOME, style=STYLE_PRIMARY)],
+    ]
+    if is_admin(user_id):
+        rows.append([KeyboardButton(MENU_ADMIN)])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
+
+def build_welcome_text(first_name: str, balance: float, currency: str) -> str:
+    """Welcome card in the Su Store layout, with the live balance."""
+    name = html.escape(first_name or DEFAULT_CUSTOMER)
+    return (
+        f"\u26a1\ufe0f <b>Welcome, {name}</b> \u2611\ufe0f\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001f7e2 <b>\u0631\u0635\u064a\u062f\u0643:</b> <code>{balance:.2f}</code> {html.escape(currency)}\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        "\U0001f4f6 <b>\u0627\u0644\u0634\u0631\u0627\u0626\u062d</b> \u2022 \u26a1\ufe0f <b>\u062a\u0633\u0644\u064a\u0645 \u0641\u0648\u0631\u064a</b>\n"
+        "\u00bb <b>\u0627\u062e\u062a\u0631 \u0627\u0644\u0642\u0633\u0645 \u0645\u0646 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0628\u0627\u0644\u0623\u0633\u0641\u0644</b> \U0001f447"
+    )
 
 
 # ==============================================================================
@@ -102,6 +212,8 @@ async def safe_edit_or_send(
     text: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
 ) -> None:
+    if reply_markup is not None:
+        reply_markup = styled_markup(reply_markup)
     if update.callback_query:
         q = update.callback_query
         try:
@@ -177,7 +289,7 @@ async def deliver_esim_to_chat(
         "3\ufe0f\u20e3 \u0627\u0645\u0633\u062d \u0643\u0648\u062f \u0627\u0644\u0640 QR \u0627\u0644\u0645\u0631\u0641\u0642 \u0623\u0648 \u0627\u0646\u0633\u062e \u0643\u0648\u062f \u0627\u0644\u0640 LPA \u0623\u0639\u0644\u0627\u0647 \u0648\u0623\u062f\u062e\u0644\u0647 \u064a\u062f\u0648\u064a\u0627\u064b.",
     ])
     caption = "\n".join(caption_lines)
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]])
+    kb = styled_markup(InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]))
 
     # Send QR photo (either stored QR image or dynamically generated from LPA)
     sent_photo = False
@@ -256,6 +368,7 @@ async def broadcast_new_inventory(
         [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
     ])
 
+    kb = styled_markup(kb)
     sent = 0
     failed = 0
     for u in users:
@@ -302,15 +415,7 @@ async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     u_row = db.upsert_user(user.id, user.username, user.full_name)
     currency = get_currency()
-
-    text = (
-        f"\U0001f44b <b>\u0623\u0647\u0644\u0627\u064b \u0628\u0643 \u064a\u0627 {html.escape(user.first_name or DEFAULT_CUSTOMER)} \u0641\u064a \u0645\u062a\u062c\u0631 \u0634\u0631\u0627\u0626\u062d eSIM \u0627\u0644\u0631\u0642\u0645\u064a\u0629!</b>\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        "\U0001f310 \u0646\u0642\u062f\u0645 \u0644\u0643 \u0634\u0631\u0627\u0626\u062d \u0627\u062a\u0635\u0627\u0644 \u0625\u0644\u0643\u062a\u0631\u0648\u0646\u064a\u0629 (eSIM) \u0641\u0648\u0631\u064a\u0629 \u0644\u062c\u0645\u064a\u0639 \u062f\u0648\u0644 \u0627\u0644\u0639\u0627\u0644\u0645 \u0628\u0623\u0633\u0639\u0627\u0631 \u062a\u0646\u0627\u0641\u0633\u064a\u0629 \u0648\u0627\u0633\u062a\u0644\u0627\u0645 \u0641\u0648\u0631\u064a \u0644\u0643\u0648\u062f \u0627\u0644\u0640 QR.\n\n"
-        f"\U0001f194 <b>\u0645\u0639\u0631\u0641 \u062d\u0633\u0627\u0628\u0643:</b> <code>{user.id}</code>\n"
-        f"\U0001f4b0 <b>\u0631\u0635\u064a\u062f\u0643 \u0627\u0644\u062d\u0627\u0644\u064a:</b> <code>{float(u_row['balance']):.2f}</code> {html.escape(currency)}\n\n"
-        "\U0001f447 <b>\u0627\u062e\u062a\u0631 \u0645\u0646 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062a\u0627\u0644\u064a\u0629 \u0645\u0627 \u064a\u0646\u0627\u0633\u0628\u0643:</b>"
-    )
+    text = build_welcome_text(user.first_name, float(u_row["balance"]), currency)
     await safe_edit_or_send(update, text, build_home_keyboard(user.id))
 
 
@@ -367,6 +472,16 @@ async def show_admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ==============================================================================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await show_home(update, context)
+    # Activate the persistent bottom reply menu (Su Store style). A reply
+    # keyboard can only be attached to a regular message, not to an inline
+    # edit, so it is sent once here on /start; after that it stays visible.
+    user = update.effective_user
+    if update.message and user and not (db.is_user_banned(user.id) and not is_admin(user.id)):
+        await update.message.reply_text(
+            "\u2328\ufe0f <b>\u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0633\u0631\u064a\u0639\u0629 \u0645\u0641\u0639\u0651\u0644\u0629</b> \u2014 \u062a\u0646\u0642\u0651\u0644 \u0645\u0646 \u0627\u0644\u0623\u0632\u0631\u0627\u0631 \u0628\u0627\u0644\u0623\u0633\u0641\u0644 \U0001f447",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_reply_menu(user.id),
+        )
 
 
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -374,6 +489,151 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u26d4 \u0639\u0630\u0631\u0627\u064b\u060c \u0647\u0630\u0627 \u0627\u0644\u0623\u0645\u0631 \u0645\u062e\u0635\u0635 \u0644\u0645\u0627\u0644\u0643 \u0627\u0644\u0628\u0648\u062a \u0641\u0642\u0637.")
         return
     await show_admin_home(update, context)
+
+
+
+# ==============================================================================
+# User Screens (shared by inline buttons and the bottom reply menu)
+# ==============================================================================
+
+async def show_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    currency = get_currency()
+    u_row = db.get_user(user.id)
+    purchases = db.get_user_purchases(user.id)
+    text = (
+        "\U0001f4b0 <b>\u062a\u0641\u0627\u0635\u064a\u0644 \u062d\u0633\u0627\u0628\u064a \u0648\u0631\u0635\u064a\u062f\u064a</b>\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001f464 <b>\u0627\u0644\u0627\u0633\u0645:</b> {html.escape(user.full_name or '')}\n"
+        f"\U0001f194 <b>\u0627\u0644\u0645\u0639\u0631\u0641 (ID):</b> <code>{user.id}</code>\n"
+        f"\U0001f4b5 <b>\u0627\u0644\u0631\u0635\u064a\u062f \u0627\u0644\u0645\u062a\u0627\u062d:</b> <code>{float(u_row['balance']):.2f}</code> {html.escape(currency)}\n"
+        f"\U0001f4e6 <b>\u0625\u062c\u0645\u0627\u0644\u064a \u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0627\u0644\u0645\u0634\u062a\u0631\u0627\u0629:</b> {len(purchases)} \u0634\u0631\u064a\u062d\u0629\n"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001f4b3 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0627\u0644\u0622\u0646", callback_data="u_topup")],
+        [InlineKeyboardButton("\U0001f4e6 \u0639\u0631\u0636 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a", callback_data="u_purchases")],
+        [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+    ])
+    await safe_edit_or_send(update, text, kb)
+    return
+
+
+async def show_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    currency = get_currency()
+    support_user = db.get_setting("support_username", "Support").lstrip("@")
+    text = (
+        "\U0001f6df <b>\u0645\u0631\u0643\u0632 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a \u0648\u062e\u062f\u0645\u0629 \u0627\u0644\u0639\u0645\u0644\u0627\u0621</b>\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        "\u0625\u0630\u0627 \u0648\u0627\u062c\u0647\u062a\u0643 \u0623\u064a \u0645\u0634\u0643\u0644\u0629 \u0641\u064a \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0623\u0648 \u062a\u0641\u0639\u064a\u0644 \u0634\u0631\u064a\u062d\u0629 \u0627\u0644\u0640 eSIM \u0627\u0644\u062e\u0627\u0635\u0629 \u0628\u0643\u060c \u064a\u0633\u0639\u062f\u0646\u0627 \u062a\u0648\u0627\u0635\u0644\u0643 \u0645\u0639\u0646\u0627 \u0645\u0628\u0627\u0634\u0631\u0629:\n\n"
+        f"\U0001f468\u200d\U0001f4bb <b>\u062d\u0633\u0627\u0628 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a:</b> @{html.escape(support_user)}\n"
+        f"\U0001f194 <b>\u0645\u0639\u0631\u0641 \u062d\u0633\u0627\u0628\u0643 \u0644\u062a\u0632\u0648\u064a\u062f \u0627\u0644\u062f\u0639\u0645 \u0628\u0647:</b> <code>{user.id}</code>"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001f4ac \u0645\u0631\u0627\u0633\u0644\u0629 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a \u0645\u0628\u0627\u0634\u0631\u0629", url=f"https://t.me/{support_user}")],
+        [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+    ])
+    await safe_edit_or_send(update, text, kb)
+    return
+
+
+async def show_countries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    currency = get_currency()
+    countries = db.get_countries()
+    if not countries:
+        text = (
+            "\U0001f30d <b>\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062f\u0648\u0644 \u0627\u0644\u0645\u062a\u0627\u062d\u0629</b>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "\u26a0\ufe0f \u0644\u0627 \u062a\u0648\u062c\u062f \u062f\u0648\u0644 \u0645\u0636\u0627\u0641\u0629 \u062d\u0627\u0644\u064a\u0627\u064b \u0641\u064a \u0627\u0644\u0645\u062a\u062c\u0631. \u064a\u0631\u062c\u0649 \u0627\u0644\u0645\u062d\u0627\u0648\u0644\u0629 \u0644\u0627\u062d\u0642\u0627\u064b."
+        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]])
+        await safe_edit_or_send(update, text, kb)
+        return
+
+    rows = []
+    for c in countries:
+        stock = int(c["available_stock"] or 0)
+        badge = (f"\u2014 \u0634\u0631\u064a\u062d\u0629 \u0648\u0627\u062d\u062f\u0629" if stock == 1 else f"\u2014 \u0634\u0631\u064a\u062d\u062a\u064a\u0646" if stock == 2 else f"\u2014 {stock} \u0634\u0631\u0627\u0626\u062d \u0645\u062a\u0627\u062d\u0629") if stock > 0 else "\u2014 \u274c \u0646\u0641\u062f\u062a \u0627\u0644\u0643\u0645\u064a\u0629"
+        rows.append([
+            InlineKeyboardButton(
+                f"{c['name']} {badge}",
+                callback_data=f"u_country:{c['id']}",
+            )
+        ])
+    rows.append([InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
+    text = (
+        "\U0001f30d <b>\u0627\u062e\u062a\u0631 \u0627\u0644\u062f\u0648\u0644\u0629 \u0627\u0644\u062a\u064a \u062a\u0631\u063a\u0628 \u0628\u0634\u0631\u0627\u0621 \u0634\u0631\u064a\u062d\u0629 eSIM \u0644\u0647\u0627:</b>\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        "\u064a\u0638\u0647\u0631 \u0628\u062c\u0627\u0646\u0628 \u0643\u0644 \u062f\u0648\u0644\u0629 \u0639\u062f\u062f \u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0627\u0644\u0645\u062a\u0648\u0641\u0631\u0629 \u0644\u0644\u0627\u0633\u062a\u0644\u0627\u0645 \u0627\u0644\u0641\u0648\u0631\u064a:"
+    )
+    await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
+    return
+
+
+async def show_purchases(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    currency = get_currency()
+    purchases = db.get_user_purchases(user.id)
+    if not purchases:
+        text = (
+            "\U0001f4e6 <b>\u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a \u0627\u0644\u0633\u0627\u0628\u0642\u0629</b>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "\u0644\u0645 \u062a\u0642\u0645 \u0628\u0634\u0631\u0627\u0621 \u0623\u064a \u0634\u0631\u064a\u062d\u0629 eSIM \u062d\u062a\u0649 \u0627\u0644\u0622\u0646."
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001f6d2 \u062a\u0635\u0641\u062d \u0627\u0644\u062f\u0648\u0644 \u0648\u0627\u0644\u0628\u0627\u0642\u0627\u062a", callback_data="u_countries")],
+            [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+        ])
+        await safe_edit_or_send(update, text, kb)
+        return
+
+    rows = []
+    for item in purchases[:20]:
+        rows.append([
+            InlineKeyboardButton(
+                f"\U0001f4f2 #{item['id']} | {item['country_name']} - {item['plan_name']} ({float(item['sold_price'] or 0):.2f} {currency})",
+                callback_data=f"u_view_esim:{item['id']}",
+            )
+        ])
+    rows.append([InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
+    text = (
+        "\U0001f4e6 <b>\u0633\u062c\u0644 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a \u0645\u0646 \u0634\u0631\u0627\u0626\u062d eSIM</b>\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        "\U0001f447 \u0627\u0636\u063a\u0637 \u0639\u0644\u0649 \u0623\u064a \u0634\u0631\u064a\u062d\u0629 \u0644\u0625\u0639\u0627\u062f\u0629 \u0639\u0631\u0636 \u0643\u0648\u062f \u0627\u0644\u0640 QR \u0648\u0643\u0648\u062f \u0627\u0644\u062a\u0641\u0639\u064a\u0644 \u0627\u0644\u062e\u0627\u0635 \u0628\u0647\u0627:"
+    )
+    await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
+    return
+
+
+async def show_topup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    currency = get_currency()
+    clear_state(context)
+    text = (
+        "\U0001f4b3 <b>\u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0641\u064a \u0627\u0644\u0628\u0648\u062a</b>\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        "\u0627\u062e\u062a\u0631 \u0648\u0633\u064a\u0644\u0629 \u0627\u0644\u062f\u0641\u0639 \u0627\u0644\u0645\u0646\u0627\u0633\u0628\u0629 \u0644\u0643 \u0644\u0634\u062d\u0646 \u0631\u0635\u064a\u062f\u0643:\n\n"
+        "\U0001f7e1 <b>Binance Pay (\u0639\u0645\u0644\u0627\u062a \u0631\u0642\u0645\u064a\u0629 - USDT)</b>\n"
+        "\U0001f7e3 <b>InstaPay EG (\u0625\u0646\u0633\u062a\u0627 \u0628\u0627\u064a \u0645\u0635\u0631)</b>"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001f7e1 \u0627\u0644\u062f\u0641\u0639 \u0639\u0628\u0631 Binance ID (\u0639\u0645\u0644\u0627\u062a \u0631\u0642\u0645\u064a\u0629)", callback_data="u_topup_m:binance")],
+        [InlineKeyboardButton("\U0001f7e3 \u0627\u0644\u062f\u0641\u0639 \u0639\u0628\u0631 InstaPay EG (\u0625\u0646\u0633\u062a\u0627 \u0628\u0627\u064a)", callback_data="u_topup_m:instapay")],
+        [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+    ])
+    await safe_edit_or_send(update, text, kb)
+    return
 
 
 # ==============================================================================
@@ -401,72 +661,18 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # ---------------- USER: ACCOUNT & SUPPORT ----------------
     if data == "u_account":
         await q.answer()
-        u_row = db.get_user(user.id)
-        purchases = db.get_user_purchases(user.id)
-        text = (
-            "\U0001f4b0 <b>\u062a\u0641\u0627\u0635\u064a\u0644 \u062d\u0633\u0627\u0628\u064a \u0648\u0631\u0635\u064a\u062f\u064a</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            f"\U0001f464 <b>\u0627\u0644\u0627\u0633\u0645:</b> {html.escape(user.full_name or '')}\n"
-            f"\U0001f194 <b>\u0627\u0644\u0645\u0639\u0631\u0641 (ID):</b> <code>{user.id}</code>\n"
-            f"\U0001f4b5 <b>\u0627\u0644\u0631\u0635\u064a\u062f \u0627\u0644\u0645\u062a\u0627\u062d:</b> <code>{float(u_row['balance']):.2f}</code> {html.escape(currency)}\n"
-            f"\U0001f4e6 <b>\u0625\u062c\u0645\u0627\u0644\u064a \u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0627\u0644\u0645\u0634\u062a\u0631\u0627\u0629:</b> {len(purchases)} \u0634\u0631\u064a\u062d\u0629\n"
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("\U0001f4b3 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0627\u0644\u0622\u0646", callback_data="u_topup")],
-            [InlineKeyboardButton("\U0001f4e6 \u0639\u0631\u0636 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a", callback_data="u_purchases")],
-            [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
-        ])
-        await safe_edit_or_send(update, text, kb)
+        await show_account(update, context)
         return
 
     if data == "u_support":
         await q.answer()
-        support_user = db.get_setting("support_username", "Support").lstrip("@")
-        text = (
-            "\U0001f6df <b>\u0645\u0631\u0643\u0632 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a \u0648\u062e\u062f\u0645\u0629 \u0627\u0644\u0639\u0645\u0644\u0627\u0621</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            "\u0625\u0630\u0627 \u0648\u0627\u062c\u0647\u062a\u0643 \u0623\u064a \u0645\u0634\u0643\u0644\u0629 \u0641\u064a \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0623\u0648 \u062a\u0641\u0639\u064a\u0644 \u0634\u0631\u064a\u062d\u0629 \u0627\u0644\u0640 eSIM \u0627\u0644\u062e\u0627\u0635\u0629 \u0628\u0643\u060c \u064a\u0633\u0639\u062f\u0646\u0627 \u062a\u0648\u0627\u0635\u0644\u0643 \u0645\u0639\u0646\u0627 \u0645\u0628\u0627\u0634\u0631\u0629:\n\n"
-            f"\U0001f468\u200d\U0001f4bb <b>\u062d\u0633\u0627\u0628 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a:</b> @{html.escape(support_user)}\n"
-            f"\U0001f194 <b>\u0645\u0639\u0631\u0641 \u062d\u0633\u0627\u0628\u0643 \u0644\u062a\u0632\u0648\u064a\u062f \u0627\u0644\u062f\u0639\u0645 \u0628\u0647:</b> <code>{user.id}</code>"
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("\U0001f4ac \u0645\u0631\u0627\u0633\u0644\u0629 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a \u0645\u0628\u0627\u0634\u0631\u0629", url=f"https://t.me/{support_user}")],
-            [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
-        ])
-        await safe_edit_or_send(update, text, kb)
+        await show_support(update, context)
         return
 
     # ---------------- USER: BUY eSIM FLOW ----------------
     if data == "u_countries":
         await q.answer()
-        countries = db.get_countries()
-        if not countries:
-            text = (
-                "\U0001f30d <b>\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062f\u0648\u0644 \u0627\u0644\u0645\u062a\u0627\u062d\u0629</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u26a0\ufe0f \u0644\u0627 \u062a\u0648\u062c\u062f \u062f\u0648\u0644 \u0645\u0636\u0627\u0641\u0629 \u062d\u0627\u0644\u064a\u0627\u064b \u0641\u064a \u0627\u0644\u0645\u062a\u062c\u0631. \u064a\u0631\u062c\u0649 \u0627\u0644\u0645\u062d\u0627\u0648\u0644\u0629 \u0644\u0627\u062d\u0642\u0627\u064b."
-            )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]])
-            await safe_edit_or_send(update, text, kb)
-            return
-
-        rows = []
-        for c in countries:
-            stock = int(c["available_stock"] or 0)
-            badge = f"\u2705 ({stock})" if stock > 0 else "\u274c \u0646\u0641\u062f"
-            rows.append([
-                InlineKeyboardButton(
-                    f"{c['name']} \u2014 {badge}",
-                    callback_data=f"u_country:{c['id']}",
-                )
-            ])
-        rows.append([InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
-        text = (
-            "\U0001f30d <b>\u0627\u062e\u062a\u0631 \u0627\u0644\u062f\u0648\u0644\u0629 \u0627\u0644\u062a\u064a \u062a\u0631\u063a\u0628 \u0628\u0634\u0631\u0627\u0621 \u0634\u0631\u064a\u062d\u0629 eSIM \u0644\u0647\u0627:</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            "\u064a\u0638\u0647\u0631 \u0628\u062c\u0627\u0646\u0628 \u0643\u0644 \u062f\u0648\u0644\u0629 \u0639\u062f\u062f \u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0627\u0644\u0645\u062a\u0648\u0641\u0631\u0629 \u0644\u0644\u0627\u0633\u062a\u0644\u0627\u0645 \u0627\u0644\u0641\u0648\u0631\u064a:"
-        )
-        await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
+        await show_countries(update, context)
         return
 
     if data.startswith("u_country:"):
@@ -594,35 +800,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # ---------------- USER: MY PURCHASES ----------------
     if data == "u_purchases":
         await q.answer()
-        purchases = db.get_user_purchases(user.id)
-        if not purchases:
-            text = (
-                "\U0001f4e6 <b>\u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a \u0627\u0644\u0633\u0627\u0628\u0642\u0629</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u0644\u0645 \u062a\u0642\u0645 \u0628\u0634\u0631\u0627\u0621 \u0623\u064a \u0634\u0631\u064a\u062d\u0629 eSIM \u062d\u062a\u0649 \u0627\u0644\u0622\u0646."
-            )
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("\U0001f6d2 \u062a\u0635\u0641\u062d \u0627\u0644\u062f\u0648\u0644 \u0648\u0627\u0644\u0628\u0627\u0642\u0627\u062a", callback_data="u_countries")],
-                [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
-            ])
-            await safe_edit_or_send(update, text, kb)
-            return
-
-        rows = []
-        for item in purchases[:20]:
-            rows.append([
-                InlineKeyboardButton(
-                    f"\U0001f4f2 #{item['id']} | {item['country_name']} - {item['plan_name']} ({float(item['sold_price'] or 0):.2f} {currency})",
-                    callback_data=f"u_view_esim:{item['id']}",
-                )
-            ])
-        rows.append([InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
-        text = (
-            "\U0001f4e6 <b>\u0633\u062c\u0644 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a \u0645\u0646 \u0634\u0631\u0627\u0626\u062d eSIM</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            "\U0001f447 \u0627\u0636\u063a\u0637 \u0639\u0644\u0649 \u0623\u064a \u0634\u0631\u064a\u062d\u0629 \u0644\u0625\u0639\u0627\u062f\u0629 \u0639\u0631\u0636 \u0643\u0648\u062f \u0627\u0644\u0640 QR \u0648\u0643\u0648\u062f \u0627\u0644\u062a\u0641\u0639\u064a\u0644 \u0627\u0644\u062e\u0627\u0635 \u0628\u0647\u0627:"
-        )
-        await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
+        await show_purchases(update, context)
         return
 
     if data.startswith("u_view_esim:"):
@@ -643,20 +821,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # ---------------- USER: TOP-UP FLOW ----------------
     if data == "u_topup":
         await q.answer()
-        clear_state(context)
-        text = (
-            "\U0001f4b3 <b>\u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0641\u064a \u0627\u0644\u0628\u0648\u062a</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            "\u0627\u062e\u062a\u0631 \u0648\u0633\u064a\u0644\u0629 \u0627\u0644\u062f\u0641\u0639 \u0627\u0644\u0645\u0646\u0627\u0633\u0628\u0629 \u0644\u0643 \u0644\u0634\u062d\u0646 \u0631\u0635\u064a\u062f\u0643:\n\n"
-            "\U0001f7e1 <b>Binance Pay (\u0639\u0645\u0644\u0627\u062a \u0631\u0642\u0645\u064a\u0629 - USDT)</b>\n"
-            "\U0001f7e3 <b>InstaPay EG (\u0625\u0646\u0633\u062a\u0627 \u0628\u0627\u064a \u0645\u0635\u0631)</b>"
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("\U0001f7e1 \u0627\u0644\u062f\u0641\u0639 \u0639\u0628\u0631 Binance ID (\u0639\u0645\u0644\u0627\u062a \u0631\u0642\u0645\u064a\u0629)", callback_data="u_topup_m:binance")],
-            [InlineKeyboardButton("\U0001f7e3 \u0627\u0644\u062f\u0641\u0639 \u0639\u0628\u0631 InstaPay EG (\u0625\u0646\u0633\u062a\u0627 \u0628\u0627\u064a)", callback_data="u_topup_m:instapay")],
-            [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
-        ])
-        await safe_edit_or_send(update, text, kb)
+        await show_topup(update, context)
         return
 
     if data.startswith("u_topup_m:"):
@@ -1375,6 +1540,40 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     db.upsert_user(user.id, user.username, user.full_name)
+
+    # Bottom reply-menu taps (UI v2): the menu always works, even mid-flow.
+    if msg.text:
+        menu_action = {
+            MENU_SHOP: "shop",
+            MENU_TOPUP: "topup",
+            MENU_ORDERS: "orders",
+            MENU_BALANCE: "account",
+            MENU_PROFILE: "account",
+            MENU_SUPPORT: "support",
+            MENU_HOME: "home",
+            MENU_ADMIN: "admin",
+        }.get(msg.text.strip())
+        if menu_action:
+            clear_state(context)
+            if menu_action == "shop":
+                await show_countries(update, context)
+            elif menu_action == "topup":
+                await show_topup(update, context)
+            elif menu_action == "orders":
+                await show_purchases(update, context)
+            elif menu_action == "account":
+                await show_account(update, context)
+            elif menu_action == "support":
+                await show_support(update, context)
+            elif menu_action == "admin":
+                if is_admin(user.id):
+                    await show_admin_home(update, context)
+                else:
+                    await show_home(update, context)
+            else:
+                await show_home(update, context)
+            return
+
     state = context.user_data.get("state")
     temp = context.user_data.get("temp", {})
     currency = get_currency()
