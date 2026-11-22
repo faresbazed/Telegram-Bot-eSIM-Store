@@ -12,6 +12,8 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
     InputFile,
 )
 from telegram.constants import ParseMode
@@ -373,6 +375,121 @@ def build_home_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+# ==============================================================================
+# Persistent Bottom Reply Keyboard (colored quick menu)
+# ==============================================================================
+BTN_STORE = "\U0001f6cd\ufe0f \u0627\u0644\u0645\u062a\u062c\u0631"
+BTN_TOPUP = "\U0001f4b3 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f"
+BTN_ACCOUNT = "\U0001f4b0 \u0631\u0635\u064a\u062f\u064a \u0648\u062d\u0633\u0627\u0628\u064a"
+BTN_PURCHASES = "\U0001f4e6 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a"
+BTN_REFUND = "\u21a9\ufe0f \u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f"
+BTN_SUPPORT = "\U0001f6df \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a"
+BTN_ADMIN = "\U0001f6e0\ufe0f \u0644\u0648\u062d\u0629 \u0627\u0644\u0623\u062f\u0645\u0646"
+
+REPLY_MENU_ACTIONS = {
+    BTN_STORE: "u_countries",
+    BTN_TOPUP: "u_topup",
+    BTN_ACCOUNT: "u_account",
+    BTN_PURCHASES: "u_purchases",
+    BTN_REFUND: "u_refund",
+    BTN_SUPPORT: "u_support",
+    BTN_ADMIN: "adm_home",
+}
+
+# Keywords from older bottom-keyboard layouts so legacy buttons keep working
+# until every client receives the refreshed keyboard (matched in order).
+MENU_KEYWORD_ACTIONS = [
+    ("\u0634\u062d\u0646", "u_topup"),
+    ("\u0627\u0633\u062a\u0631\u062f\u0627\u062f", "u_refund"),
+    ("\u0631\u0635\u064a\u062f\u064a", "u_account"),
+    ("\u062d\u0633\u0627\u0628\u064a", "u_account"),
+    ("\u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a", "u_purchases"),
+    ("\u0637\u0644\u0628\u0627\u062a\u064a", "u_purchases"),
+    ("\u0645\u0646\u062a\u062c\u0627\u062a\u064a", "u_purchases"),
+    ("\u0627\u0644\u062f\u0639\u0645", "u_support"),
+    ("\u0627\u0644\u0623\u062f\u0645\u0646", "adm_home"),
+    ("\u0627\u0644\u0645\u062a\u062c\u0631", "u_countries"),
+    ("\u0627\u0644\u0645\u062e\u0632\u0648\u0646", "u_countries"),
+    ("\u0627\u0644\u0634\u0631\u0627\u0626\u062d", "u_countries"),
+]
+
+
+def _norm_menu_text(text: str) -> str:
+    return " ".join((text or "").replace("\ufe0f", "").split())
+
+
+def match_reply_menu_action(text: str, exact_only: bool = False) -> Optional[str]:
+    """Map a bottom-menu press (exact new button text, or a legacy menu phrase) to a callback action."""
+    normalized = _norm_menu_text(text)
+    if not normalized:
+        return None
+    exact_map = {_norm_menu_text(btn): action for btn, action in REPLY_MENU_ACTIONS.items()}
+    if normalized in exact_map:
+        return exact_map[normalized]
+    if exact_only:
+        return None
+    for keyword, action in MENU_KEYWORD_ACTIONS:
+        if keyword in normalized:
+            return action
+    return None
+
+
+def build_reply_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    """Persistent bottom keyboard. Button colors use the Bot API `style` field
+    (danger/success/primary); PTB 21.6 predates it, so it goes through api_kwargs."""
+    def _btn(text: str, style: str) -> KeyboardButton:
+        return KeyboardButton(text, api_kwargs={"style": style})
+
+    rows = [
+        [_btn(BTN_STORE, "primary")],
+        [_btn(BTN_TOPUP, "success")],
+        [_btn(BTN_ACCOUNT, "primary"), _btn(BTN_PURCHASES, "primary")],
+        [_btn(BTN_REFUND, "primary"), _btn(BTN_SUPPORT, "danger")],
+    ]
+    if is_admin(user_id):
+        rows.append([_btn(BTN_ADMIN, "primary")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
+
+class _ReplyMenuMessage:
+    """Minimal stand-in for the message attached to a CallbackQuery."""
+
+    def __init__(self, message) -> None:
+        self._message = message
+        self.photo = None
+        self.chat = message.chat
+        self.chat_id = message.chat_id
+
+    async def delete(self) -> None:
+        return None
+
+
+class _ReplyMenuQuery:
+    """Lets a bottom reply-keyboard press reuse the existing inline callback flows.
+    Text edits become new chat messages, since reply-keyboard presses have no
+    message to edit."""
+
+    def __init__(self, message, data: str) -> None:
+        self.data = data
+        self.message = _ReplyMenuMessage(message)
+        self._message = message
+
+    async def answer(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def edit_message_text(self, text: str, parse_mode=None, reply_markup=None, **kwargs: Any):
+        return await self._message.reply_text(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+
+
+async def route_reply_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str) -> None:
+    """Dispatch a bottom-menu press through the existing callback router."""
+    update.callback_query = _ReplyMenuQuery(update.message, action)
+    try:
+        await callback_router(update, context)
+    finally:
+        update.callback_query = None
+
+
 async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await check_ban_guard(update):
         return
@@ -453,6 +570,16 @@ async def show_admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # Command Handlers
 # ==============================================================================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if update.message and user:
+        banned = (not is_admin(user.id)) and db.is_user_banned(user.id)
+        if not banned:
+            await update.message.reply_text(
+                "\u2328\ufe0f <b>\u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0633\u0641\u0644\u064a\u0629 \u0627\u0644\u0645\u0644\u0648\u0651\u0646\u0629 \u062c\u0627\u0647\u0632\u0629!</b>\n"
+                "\u0627\u0633\u062a\u062e\u062f\u0645 \u0627\u0644\u0623\u0632\u0631\u0627\u0631 \u0628\u0627\u0644\u0623\u0633\u0641\u0644 \u0644\u0644\u062a\u0646\u0642\u0644 \u0627\u0644\u0633\u0631\u064a\u0639 \u062f\u0627\u062e\u0644 \u0627\u0644\u0645\u062a\u062c\u0631 \U0001f447",
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_reply_keyboard(user.id),
+            )
     await show_home(update, context)
 
 
@@ -1584,6 +1711,18 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     state = context.user_data.get("state")
     temp = context.user_data.get("temp", {})
     currency = get_currency()
+
+    # Bottom reply keyboard (persistent colored menu) presses.
+    # Inside an active flow only an exact button text interrupts it.
+    if msg.text:
+        menu_action = match_reply_menu_action(msg.text, exact_only=bool(state))
+        if menu_action:
+            clear_state(context)
+            if menu_action == "adm_home" and not is_admin(user.id):
+                await show_home(update, context)
+                return
+            await route_reply_menu(update, context, menu_action)
+            return
 
     # If no active state, show main menu
     if not state:
