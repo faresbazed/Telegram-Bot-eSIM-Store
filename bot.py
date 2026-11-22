@@ -273,6 +273,85 @@ async def broadcast_new_inventory(
     return sent, failed
 
 
+async def send_admin_sale_alert(
+    context: ContextTypes.DEFAULT_TYPE,
+    buyer,
+    esim: Dict[str, Any],
+) -> None:
+    """
+    Notifies the owner of a sale, identifying exactly which eSIM was sold using
+    inventory identifiers only. Activation secrets (LPA code / QR image) are NOT
+    transmitted here; the owner can inspect the sold item by its inventory id.
+    """
+    if not ADMIN_ID:
+        return
+    currency = get_currency()
+    user_tag = f"@{buyer.username}" if getattr(buyer, "username", None) else (getattr(buyer, "full_name", "") or "")
+    item_label = "\u0643\u0648\u062f \u0646\u0635\u064a (LPA)" if esim.get("item_type") == "lpa" else "\u0635\u0648\u0631\u0629 QR"
+
+    text = (
+        "\U0001f6d2 <b>\u0639\u0645\u0644\u064a\u0629 \u0628\u064a\u0639 \u0634\u0631\u064a\u062d\u0629 eSIM \u062c\u062f\u064a\u062f\u0629!</b>\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001f464 <b>\u0627\u0644\u0639\u0645\u064a\u0644:</b> {html.escape(user_tag)} (<code>{buyer.id}</code>)\n"
+        f"\U0001f30d <b>\u0627\u0644\u062f\u0648\u0644\u0629:</b> {html.escape(str(esim.get('country_name', '')))}\n"
+        f"\U0001f4e6 <b>\u0627\u0644\u0628\u0627\u0642\u0629:</b> {html.escape(str(esim.get('plan_name', '')))}\n"
+        f"\U0001f4b5 <b>\u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0645\u062e\u0635\u0648\u0645:</b> {float(esim.get('paid_price') or 0):.2f} {html.escape(currency)}\n"
+        f"\U0001f194 <b>\u0631\u0642\u0645 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0627\u0644\u0645\u0628\u0627\u0639\u0629 \u0628\u0627\u0644\u0645\u062e\u0632\u0648\u0646:</b> #{esim['id']}\n"
+        f"\U0001f3f7 <b>\u0646\u0648\u0639 \u0627\u0644\u0634\u0631\u064a\u062d\u0629:</b> {item_label}\n"
+        f"\U0001f552 <b>\u0648\u0642\u062a \u0627\u0644\u0628\u064a\u0639:</b> {esim.get('sold_at') or ''}"
+    )
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode=ParseMode.HTML)
+    except TelegramError as exc:
+        logger.warning("Failed to notify admin of sale: %s", exc)
+
+
+async def send_refund_video_to_admin(
+    context: ContextTypes.DEFAULT_TYPE,
+    req: Dict[str, Any],
+    markup: Optional[InlineKeyboardMarkup] = None,
+) -> None:
+    """Forwards the customer's refund video proof to the owner with full request details."""
+    if not ADMIN_ID:
+        return
+    currency = get_currency()
+    caption = (
+        f"\u21a9\ufe0f <b>\u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f \u062c\u062f\u064a\u062f #{req['id']}</b>\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001f464 <b>\u0627\u0644\u0639\u0645\u064a\u0644:</b> {html.escape(req.get('full_name') or '')} (@{html.escape(req.get('username') or NO_USER)})\n"
+        f"\U0001f194 <b>\u0645\u0639\u0631\u0641 \u0627\u0644\u0639\u0645\u064a\u0644:</b> <code>{req['user_id']}</code>\n"
+        f"\U0001f4f2 <b>\u0631\u0642\u0645 \u0627\u0644\u0634\u0631\u064a\u062d\u0629:</b> #{req['esim_id']}\n"
+        f"\U0001f30d <b>\u0627\u0644\u062f\u0648\u0644\u0629:</b> {html.escape(str(req.get('country_name') or ''))}\n"
+        f"\U0001f4e6 <b>\u0627\u0644\u0628\u0627\u0642\u0629:</b> {html.escape(str(req.get('plan_name') or ''))}\n"
+        f"\U0001f4b5 <b>\u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0645\u062f\u0641\u0648\u0639 \u0644\u0644\u0634\u0631\u064a\u062d\u0629:</b> <code>{float(req.get('refund_amount') or 0):.2f}</code> {html.escape(currency)}\n"
+        f"\U0001f4dd <b>\u0648\u0635\u0641 \u0627\u0644\u0645\u0634\u0643\u0644\u0629:</b> {html.escape(req.get('reason') or NONE_STR)}\n"
+        f"\U0001f4c5 <b>\u0627\u0644\u062a\u0627\u0631\u064a\u062e:</b> {req.get('created_at', '')}\n\n"
+        "\U0001f3ac <b>\u0641\u064a\u062f\u064a\u0648 \u0625\u062b\u0628\u0627\u062a \u0627\u0644\u0645\u0634\u0643\u0644\u0629 \u0645\u0631\u0641\u0642 \u0645\u0639 \u0647\u0630\u0627 \u0627\u0644\u0637\u0644\u0628.</b>"
+    )
+    video_file_id = req.get("video_file_id", "")
+    video_type = req.get("video_type", "video")
+    try:
+        if video_type == "video_note":
+            await context.bot.send_message(chat_id=ADMIN_ID, text=caption, parse_mode=ParseMode.HTML, reply_markup=markup)
+            await context.bot.send_video_note(chat_id=ADMIN_ID, video_note=video_file_id)
+        elif video_type == "document":
+            await context.bot.send_document(chat_id=ADMIN_ID, document=video_file_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=markup)
+        else:
+            await context.bot.send_video(chat_id=ADMIN_ID, video=video_file_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except TelegramError as exc:
+        logger.warning("Failed to forward refund video to admin: %s", exc)
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=caption + "\n\n\u26a0\ufe0f \u062a\u0639\u0630\u0631 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u064a\u062f\u064a\u0648 \u062a\u0644\u0642\u0627\u0626\u064a\u0627\u064b\u060c \u064a\u0631\u062c\u0649 \u0645\u0631\u0627\u062c\u0639\u0629 \u0627\u0644\u0637\u0644\u0628 \u0645\u0646 \u0644\u0648\u062d\u0629 \u0627\u0644\u062a\u062d\u0643\u0645.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+        except TelegramError:
+            pass
+
+
+
 # ==============================================================================
 # Main Menus (User & Admin)
 # ==============================================================================
@@ -285,8 +364,9 @@ def build_home_keyboard(user_id: int) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("\U0001f4e6 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a \u0627\u0644\u0633\u0627\u0628\u0642\u0629", callback_data="u_purchases"),
-            InlineKeyboardButton("\U0001f6df \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a", callback_data="u_support"),
+            InlineKeyboardButton("\u21a9\ufe0f \u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f", callback_data="u_refund"),
         ],
+        [InlineKeyboardButton("\U0001f6df \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a", callback_data="u_support")],
     ]
     if is_admin(user_id):
         rows.append([InlineKeyboardButton("\U0001f6e0 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646 (\u0627\u0644\u0645\u0627\u0644\u0643)", callback_data="adm_home")])
@@ -333,7 +413,8 @@ async def show_admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"\U0001f4f2 <b>\u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0627\u0644\u0645\u062a\u0627\u062d\u0629 \u0628\u0627\u0644\u0645\u062e\u0632\u0648\u0646:</b> {stats['available_esims']}\n"
         f"\u2705 <b>\u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0627\u0644\u0645\u0628\u0627\u0639\u0629:</b> {stats['sold_esims']}\n"
         f"\U0001f4b5 <b>\u0625\u062c\u0645\u0627\u0644\u064a \u0627\u0644\u0645\u0628\u064a\u0639\u0627\u062a:</b> {stats['total_revenue']:.2f} {html.escape(currency)}\n"
-        f"\u23f3 <b>\u0637\u0644\u0628\u0627\u062a \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0627\u0644\u0645\u0639\u0644\u0642\u0629:</b> {stats['pending_topups']}\n\n"
+        f"\u23f3 <b>\u0637\u0644\u0628\u0627\u062a \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0627\u0644\u0645\u0639\u0644\u0642\u0629:</b> {stats['pending_topups']}\n"
+        f"\u21a9\ufe0f <b>\u0637\u0644\u0628\u0627\u062a \u0627\u0644\u0627\u0633\u062a\u0631\u062f\u0627\u062f \u0627\u0644\u0645\u0639\u0644\u0642\u0629:</b> {stats['pending_refunds']}\n\n"
         "\U0001f447 <b>\u0627\u062e\u062a\u0631 \u0627\u0644\u0642\u0633\u0645 \u0627\u0644\u0630\u064a \u062a\u0631\u064a\u062f \u0625\u062f\u0627\u0631\u062a\u0647:</b>"
     )
     kb = InlineKeyboardMarkup([
@@ -348,6 +429,12 @@ async def show_admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             InlineKeyboardButton(
                 f"\U0001f4b3 \u0637\u0644\u0628\u0627\u062a \u0627\u0644\u0634\u062d\u0646 \u0648\u0627\u0644\u0623\u0631\u0635\u062f\u0629 ({stats['pending_topups']})",
                 callback_data="adm_topups_menu",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"\u21a9\ufe0f \u0637\u0644\u0628\u0627\u062a \u0627\u0644\u0627\u0633\u062a\u0631\u062f\u0627\u062f ({stats['pending_refunds']})",
+                callback_data="adm_refunds_menu",
             ),
         ],
         [
@@ -573,22 +660,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             esim=result,
             header_title="\U0001f389 <b>\u062a\u0645 \u0634\u0631\u0627\u0621 \u0634\u0631\u064a\u062d\u0629 eSIM \u0628\u0646\u062c\u0627\u062d!</b>",
         )
-        # Notify Admin of sale
-        if ADMIN_ID:
-            try:
-                user_tag = f"@{user.username}" if user.username else user.full_name
-                admin_msg = (
-                    "\U0001f6d2 <b>\u0639\u0645\u0644\u064a\u0629 \u0628\u064a\u0639 \u0634\u0631\u064a\u062d\u0629 eSIM \u062c\u062f\u064a\u062f\u0629!</b>\n"
-                    "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                    f"\U0001f464 <b>\u0627\u0644\u0639\u0645\u064a\u0644:</b> {html.escape(user_tag or '')} (<code>{user.id}</code>)\n"
-                    f"\U0001f30d <b>\u0627\u0644\u062f\u0648\u0644\u0629:</b> {html.escape(result['country_name'])}\n"
-                    f"\U0001f4e6 <b>\u0627\u0644\u0628\u0627\u0642\u0629:</b> {html.escape(result['plan_name'])}\n"
-                    f"\U0001f4b5 <b>\u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0645\u062e\u0635\u0648\u0645:</b> {float(result['paid_price']):.2f} {html.escape(currency)}\n"
-                    f"\U0001f194 <b>\u0631\u0642\u0645 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0628\u0627\u0644\u0645\u062e\u0632\u0648\u0646:</b> #{result['id']}"
-                )
-                await context.bot.send_message(chat_id=ADMIN_ID, text=admin_msg, parse_mode=ParseMode.HTML)
-            except TelegramError:
-                pass
+        # Notify Admin of sale (identifies exactly which QR code / eSIM was sold)
+        await send_admin_sale_alert(context=context, buyer=user, esim=result)
         return
 
     # ---------------- USER: MY PURCHASES ----------------
@@ -638,6 +711,75 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             esim=esim,
             header_title=f"\U0001f4e6 <b>\u0628\u064a\u0627\u0646\u0627\u062a \u0634\u0631\u064a\u062d\u062a\u0643 \u0627\u0644\u0645\u0634\u062a\u0631\u0627\u0629 (#{esim['id']})</b>",
         )
+        return
+
+    # ---------------- USER: REFUND REQUEST FLOW ----------------
+    if data == "u_refund":
+        await q.answer()
+        clear_state(context)
+        purchases = db.get_user_purchases(user.id)
+        my_requests = db.get_user_refunds(user.id)
+        status_labels = {"pending": "\u23f3 \u0642\u064a\u062f \u0627\u0644\u0645\u0631\u0627\u062c\u0639\u0629", "reviewed": "\u2705 \u062a\u0645\u062a \u0627\u0644\u0645\u0631\u0627\u062c\u0639\u0629"}
+        requests_lines = ""
+        if my_requests:
+            requests_lines = "\n\U0001f4cb <b>\u0637\u0644\u0628\u0627\u062a\u0643 \u0627\u0644\u0633\u0627\u0628\u0642\u0629:</b>\n" + "\n".join(
+                f"\u2022 \u0637\u0644\u0628 #{r['id']} | \u0634\u0631\u064a\u062d\u0629 #{r['esim_id']} ({html.escape(r['country_name'])} - {html.escape(r['plan_name'])}) \u2014 {status_labels.get(r['status'], r['status'])}"
+                for r in my_requests[:10]
+            ) + "\n"
+
+        if not purchases:
+            text = (
+                "\u21a9\ufe0f <b>\u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f</b>\n"
+                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                "\u0644\u0645 \u062a\u0642\u0645 \u0628\u0623\u064a \u0639\u0645\u0644\u064a\u0629 \u0634\u0631\u0627\u0621 \u062d\u062a\u0649 \u0627\u0644\u0622\u0646."
+                + requests_lines
+            )
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f6d2 \u062a\u0635\u0641\u062d \u0627\u0644\u062f\u0648\u0644 \u0648\u0627\u0644\u0628\u0627\u0642\u0627\u062a", callback_data="u_countries")],
+                [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+            ])
+            await safe_edit_or_send(update, text, kb)
+            return
+
+        rows = []
+        for item in purchases[:20]:
+            rows.append([
+                InlineKeyboardButton(
+                    f"\U0001f4f2 #{item['id']} | {item['country_name']} - {item['plan_name']} ({float(item['sold_price'] or 0):.2f} {currency})",
+                    callback_data=f"u_refund_esim:{item['id']}",
+                )
+            ])
+        rows.append([InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
+        text = (
+            "\u21a9\ufe0f <b>\u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f</b>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "\u0627\u062e\u062a\u0631 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0627\u0644\u062a\u064a \u062a\u0648\u062c\u062f \u0628\u0647\u0627 \u0645\u0634\u0643\u0644\u0629 \u0644\u0625\u0631\u0633\u0627\u0644 \u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f \u0644\u0644\u0625\u062f\u0627\u0631\u0629:\n\n"
+            "\u26a0\ufe0f <b>\u0645\u0644\u0627\u062d\u0638\u0629:</b> \u0633\u064a\u064f\u0637\u0644\u0628 \u0645\u0646\u0643 \u0625\u0631\u0633\u0627\u0644 <b>\u0641\u064a\u062f\u064a\u0648 \u0625\u062b\u0628\u0627\u062a</b> \u064a\u0648\u0636\u062d \u0643\u0627\u0641\u0629 \u062a\u0641\u0627\u0635\u064a\u0644 \u0627\u0644\u0645\u0634\u0643\u0644\u0629\u060c \u0648\u0633\u064a\u062a\u0645 \u0645\u0631\u0627\u062c\u0639\u0629 \u0637\u0644\u0628\u0643 \u0645\u0646 \u0627\u0644\u0625\u062f\u0627\u0631\u0629."
+            + requests_lines
+        )
+        await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("u_refund_esim:"):
+        esim_id = int(data.split(":")[1])
+        esim = db.get_esim(esim_id)
+        if not esim or esim.get("sold_to") != user.id:
+            await q.answer("\u26a0\ufe0f \u062a\u0639\u0630\u0631 \u0627\u0644\u0639\u062b\u0648\u0631 \u0639\u0644\u0649 \u0647\u0630\u0647 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0636\u0645\u0646 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u0643.", show_alert=True)
+            return
+        await q.answer()
+        context.user_data["state"] = "USER_REFUND_REASON"
+        context.user_data["temp"] = {"esim_id": esim_id}
+        text = (
+            f"\u21a9\ufe0f <b>\u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f \u0644\u0644\u0634\u0631\u064a\u062d\u0629 #{esim_id}</b>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"\U0001f30d <b>\u0627\u0644\u062f\u0648\u0644\u0629:</b> {html.escape(esim['country_name'])}\n"
+            f"\U0001f4e6 <b>\u0627\u0644\u0628\u0627\u0642\u0629:</b> {html.escape(esim['plan_name'])}\n"
+            f"\U0001f4b5 <b>\u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0645\u062f\u0641\u0648\u0639:</b> <code>{float(esim['sold_price'] or 0):.2f}</code> {html.escape(currency)}\n\n"
+            "1\ufe0f\u20e3 <b>\u0627\u0644\u062e\u0637\u0648\u0629 \u0627\u0644\u0623\u0648\u0644\u0649:</b> \u0627\u0643\u062a\u0628 \u0627\u0644\u0622\u0646 <b>\u0648\u0635\u0641\u0627\u064b \u0645\u062e\u062a\u0635\u0631\u0627\u064b \u0644\u0644\u0645\u0634\u0643\u0644\u0629</b> \u0641\u064a \u0631\u0633\u0627\u0644\u0629 \u0646\u0635\u064a\u0629 "
+            "(\u0645\u062b\u0627\u0644: <code>\u0643\u0648\u062f QR \u0644\u0627 \u064a\u0639\u0645\u0644</code> \u0623\u0648 <code>\u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0645\u0641\u0639\u0644\u0629 \u0645\u0633\u0628\u0642\u0627\u064b</code>):"
+        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0625\u0644\u063a\u0627\u0621 \u0627\u0644\u0637\u0644\u0628", callback_data="u_refund")]])
+        await safe_edit_or_send(update, text, kb)
         return
 
     # ---------------- USER: TOP-UP FLOW ----------------
@@ -1119,6 +1261,70 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 )
             return
 
+        # ---------------- ADMIN: REFUND REQUESTS ----------------
+        if data == "adm_refunds_menu":
+            await q.answer()
+            clear_state(context)
+            pending = db.get_pending_refunds()
+            rows = []
+            for req in pending[:20]:
+                rows.append([
+                    InlineKeyboardButton(
+                        f"\u23f3 \u0637\u0644\u0628 #{req['id']} | {req['full_name'] or req['user_id']} | {req['country_name']} - {req['plan_name']} ({float(req['refund_amount'] or 0):.2f} {currency})",
+                        callback_data=f"adm_refund_view:{req['id']}",
+                    )
+                ])
+            rows.append([InlineKeyboardButton("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
+            text = (
+                "\u21a9\ufe0f <b>\u0637\u0644\u0628\u0627\u062a \u0627\u0644\u0627\u0633\u062a\u0631\u062f\u0627\u062f \u0627\u0644\u0645\u0639\u0644\u0642\u0629</b>\n"
+                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                f"\u0627\u0644\u0639\u062f\u062f \u0627\u0644\u062d\u0627\u0644\u064a: <b>{len(pending)}</b> \u0637\u0644\u0628\n\n"
+                "\u0627\u0636\u063a\u0637 \u0639\u0644\u0649 \u0623\u064a \u0637\u0644\u0628 \u0644\u0639\u0631\u0636 \u0641\u064a\u062f\u064a\u0648 \u0627\u0644\u0625\u062b\u0628\u0627\u062a \u0648\u0627\u0644\u062a\u0641\u0627\u0635\u064a\u0644 \u0648\u0627\u0644\u0628\u062a \u0641\u064a\u0647:"
+            )
+            await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
+            return
+
+        if data.startswith("adm_refund_view:"):
+            await q.answer()
+            req_id = int(data.split(":")[1])
+            req = db.get_refund_request(req_id)
+            if not req:
+                return
+            adm_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("\u2705 \u062a\u0645\u062a \u0627\u0644\u0645\u0631\u0627\u062c\u0639\u0629 (\u0628\u062f\u0648\u0646 \u062a\u0639\u062f\u064a\u0644 \u0631\u0635\u064a\u062f)", callback_data=f"adm_refund_done:{req['id']}")],
+                [InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0637\u0644\u0628\u0627\u062a", callback_data="adm_refunds_menu")],
+            ])
+            await send_refund_video_to_admin(context, req, markup=adm_kb)
+            return
+
+        if data.startswith("adm_refund_done:"):
+            req_id = int(data.split(":")[1])
+            ok, status, res = db.mark_refund_reviewed(req_id)
+            if not ok:
+                await q.answer("\u26a0\ufe0f \u062a\u0645 \u0645\u0639\u0627\u0644\u062c\u0629 \u0647\u0630\u0627 \u0627\u0644\u0637\u0644\u0628 \u0645\u0633\u0628\u0642\u0627\u064b \u0623\u0648 \u0623\u0646\u0647 \u063a\u064a\u0631 \u0645\u0648\u062c\u0648\u062f.", show_alert=True)
+                return
+
+            await q.answer("\u2705 \u062a\u0645 \u062a\u0639\u064a\u064a\u0646 \u0627\u0644\u0637\u0644\u0628 \u0643\u0645\u062a\u0645\u0629 \u0645\u0631\u0627\u062c\u0639\u062a\u0647.", show_alert=True)
+            # Review-only: no balance is credited or debited here. Any compensation
+            # remains a manual owner decision (e.g. the existing manual balance tool).
+            user_msg = (
+                f"\U0001f4cb <b>\u062a\u0645\u062a \u0645\u0631\u0627\u062c\u0639\u0629 \u0637\u0644\u0628 \u0627\u0644\u0627\u0633\u062a\u0631\u062f\u0627\u062f \u0631\u0642\u0645 #{req_id}.</b>\n"
+                "\u0633\u064a\u062a\u0648\u0627\u0635\u0644 \u0645\u0639\u0643 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a \u0628\u062e\u0635\u0648\u0635 \u0646\u062a\u064a\u062c\u0629 \u0627\u0644\u0637\u0644\u0628."
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=res["user_id"],
+                    text=user_msg,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
+                )
+            except TelegramError:
+                pass
+
+            await show_admin_home(update, context)
+            return
+
+
         # ---------------- ADMIN: TOP-UPS & BALANCE ----------------
         if data == "adm_topups_menu":
             await q.answer()
@@ -1481,6 +1687,94 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except TelegramError as exc:
                 logger.warning("Failed to notify admin of topup: %s", exc)
         return
+
+    # --------------------------------------------------------------------------
+    # USER REFUND STATES
+    # --------------------------------------------------------------------------
+    if state == "USER_REFUND_REASON":
+        if not msg.text:
+            await msg.reply_text("\u26a0\ufe0f \u064a\u0631\u062c\u0649 \u0643\u062a\u0627\u0628\u0629 \u0648\u0635\u0641 \u0645\u062e\u062a\u0635\u0631 \u0644\u0644\u0645\u0634\u0643\u0644\u0629 \u0643\u0646\u0635.")
+            return
+        temp["reason"] = msg.text.strip()
+        context.user_data["temp"] = temp
+        context.user_data["state"] = "USER_REFUND_VIDEO"
+        await msg.reply_text(
+            "\u2705 <b>\u062a\u0645 \u062a\u0633\u062c\u064a\u0644 \u0648\u0635\u0641 \u0627\u0644\u0645\u0634\u0643\u0644\u0629.</b>\n\n"
+            "2\ufe0f\u20e3 <b>\u0627\u0644\u062e\u0637\u0648\u0629 \u0627\u0644\u0623\u062e\u064a\u0631\u0629 (\u0625\u0644\u062a\u0627\u0645\u064a\u0629):</b>\n"
+            "\U0001f3ac \u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0641\u064a\u062f\u064a\u0648 \u0625\u062b\u0628\u0627\u062a \u064a\u0648\u0636\u062d \u0643\u0627\u0641\u0629 \u062a\u0641\u0627\u0635\u064a\u0644 \u0627\u0644\u0645\u0634\u0643\u0644\u0629</b> "
+            "(\u0645\u062b\u0644: \u062a\u0633\u062c\u064a\u0644 \u0634\u0627\u0634\u0629 \u064a\u0638\u0647\u0631 \u0641\u064a\u0647 \u0643\u0648\u062f \u0627\u0644\u0640 QR \u0648\u0631\u0633\u0627\u0644\u0629 \u0627\u0644\u062e\u0637\u0623 \u0639\u0646\u062f \u0627\u0644\u062a\u0641\u0639\u064a\u0644).\n"
+            "\u26a0\ufe0f <b>\u0644\u0646 \u064a\u062a\u0645 \u0642\u0628\u0648\u0644 \u0627\u0644\u0637\u0644\u0628 \u0628\u062f\u0648\u0646 \u0641\u064a\u062f\u064a\u0648.</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f3e0 \u0625\u0644\u063a\u0627\u0621 \u0648\u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
+        )
+        return
+
+    if state == "USER_REFUND_VIDEO":
+        video_file_id = ""
+        video_type = "video"
+        if msg.video:
+            video_file_id = msg.video.file_id
+            video_type = "video"
+        elif msg.video_note:
+            video_file_id = msg.video_note.file_id
+            video_type = "video_note"
+        elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("video/"):
+            video_file_id = msg.document.file_id
+            video_type = "document"
+
+        if not video_file_id:
+            await msg.reply_text(
+                "\u26a0\ufe0f <b>\u064a\u062c\u0628 \u0625\u0631\u0633\u0627\u0644 \u0641\u064a\u062f\u064a\u0648 \u0625\u062b\u0628\u0627\u062a \u0644\u0644\u0645\u0634\u0643\u0644\u0629.</b>\n"
+                "\u0627\u0644\u0635\u0648\u0631 \u0623\u0648 \u0627\u0644\u0631\u0633\u0627\u0626\u0644 \u0627\u0644\u0646\u0635\u064a\u0629 \u0648\u062d\u062f\u0647\u0627 \u063a\u064a\u0631 \u0643\u0627\u0641\u064a\u0629. \u064a\u0631\u062c\u0649 \u0625\u0631\u0633\u0627\u0644 \u0641\u064a\u062f\u064a\u0648 \u064a\u0648\u0636\u062d \u0643\u0627\u0641\u0629 \u062a\u0641\u0627\u0635\u064a\u0644 \u0627\u0644\u0645\u0634\u0643\u0644\u0629:",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        esim_id = int(temp.get("esim_id", 0))
+        esim = db.get_esim(esim_id)
+        if not esim or esim.get("sold_to") != user.id:
+            clear_state(context)
+            await msg.reply_text("\u26a0\ufe0f \u062a\u0639\u0630\u0631 \u0627\u0644\u0639\u062b\u0648\u0631 \u0639\u0644\u0649 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0627\u0644\u0645\u062e\u062a\u0627\u0631\u0629. \u062a\u0645 \u0625\u0644\u063a\u0627\u0621 \u0627\u0644\u0637\u0644\u0628.")
+            return
+
+        req_id = db.create_refund_request(
+            user_id=user.id,
+            esim_id=esim_id,
+            reason=temp.get("reason", ""),
+            video_file_id=video_file_id,
+            video_type=video_type,
+            refund_amount=float(esim.get("sold_price") or 0.0),
+        )
+        clear_state(context)
+
+        if req_id is None:
+            await msg.reply_text(
+                "\u26a0\ufe0f <b>\u064a\u0648\u062c\u062f \u0628\u0627\u0644\u0641\u0639\u0644 \u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f \u0644\u0647\u0630\u0647 \u0627\u0644\u0634\u0631\u064a\u062d\u0629.</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
+            )
+            return
+
+        await msg.reply_text(
+            f"\u2705 <b>\u062a\u0645 \u0625\u0631\u0633\u0627\u0644 \u0637\u0644\u0628 \u0627\u0644\u0627\u0633\u062a\u0631\u062f\u0627\u062f \u0631\u0642\u0645 #{req_id} \u0628\u0646\u062c\u0627\u062d!</b>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"\U0001f4f2 <b>\u0627\u0644\u0634\u0631\u064a\u062d\u0629:</b> #{esim_id} ({html.escape(esim['country_name'])} - {html.escape(esim['plan_name'])})\n"
+            f"\U0001f4b5 <b>\u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0645\u062f\u0641\u0648\u0639:</b> {float(esim.get('sold_price') or 0):.2f} {html.escape(currency)}\n"
+            "\U0001f3ac <b>\u062a\u0645 \u0625\u0631\u0633\u0627\u0644 \u0641\u064a\u062f\u064a\u0648 \u0627\u0644\u0625\u062b\u0628\u0627\u062a \u0625\u0644\u0649 \u0627\u0644\u0625\u062f\u0627\u0631\u0629.</b>\n"
+            "\u23f3 \u0637\u0644\u0628\u0643 \u0642\u064a\u062f \u0627\u0644\u0645\u0631\u0627\u062c\u0639\u0629 \u0644\u062f\u0649 \u0627\u0644\u0625\u062f\u0627\u0631\u0629\u060c \u0648\u0633\u064a\u062a\u0645 \u0625\u0634\u0639\u0627\u0631\u0643 \u0641\u0648\u0631 \u0627\u0643\u062a\u0645\u0627\u0644 \u0627\u0644\u0645\u0631\u0627\u062c\u0639\u0629.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="home")]]),
+        )
+
+        # Forward the video proof and request details to the owner
+        req = db.get_refund_request(req_id)
+        if req:
+            adm_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ تمت المراجعة (بدون تعديل رصيد)", callback_data=f"adm_refund_done:{req_id}"),
+            ]])
+            await send_refund_video_to_admin(context, req, markup=adm_kb)
+        return
+
 
     # --------------------------------------------------------------------------
     # ADMIN STATES (OWNER ONLY)

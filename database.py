@@ -74,6 +74,21 @@ def init_db() -> None:
                 processed_at TEXT,
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             );
+
+            CREATE TABLE IF NOT EXISTS refund_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                esim_id INTEGER NOT NULL,
+                reason TEXT DEFAULT '',
+                video_file_id TEXT NOT NULL,
+                video_type TEXT NOT NULL DEFAULT 'video' CHECK(video_type IN ('video', 'video_note', 'document')),
+                refund_amount REAL NOT NULL DEFAULT 0.0,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'reviewed')),
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                reviewed_at TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(user_id),
+                FOREIGN KEY (esim_id) REFERENCES esims(id)
+            );
             """
         )
         # Clean up any corrupted mojibake values from previous runs
@@ -177,6 +192,7 @@ def get_stats() -> Dict[str, Any]:
         available_esims = conn.execute("SELECT COUNT(*) AS c FROM esims WHERE status = 'available'").fetchone()["c"]
         sold_esims = conn.execute("SELECT COUNT(*) AS c FROM esims WHERE status = 'sold'").fetchone()["c"]
         pending_topups = conn.execute("SELECT COUNT(*) AS c FROM topup_requests WHERE status = 'pending'").fetchone()["c"]
+        pending_refunds = conn.execute("SELECT COUNT(*) AS c FROM refund_requests WHERE status = 'pending'").fetchone()["c"]
         total_revenue = conn.execute("SELECT COALESCE(SUM(sold_price), 0) AS s FROM esims WHERE status = 'sold'").fetchone()["s"]
         return {
             "total_users": total_users,
@@ -186,6 +202,7 @@ def get_stats() -> Dict[str, Any]:
             "available_esims": available_esims,
             "sold_esims": sold_esims,
             "pending_topups": pending_topups,
+            "pending_refunds": pending_refunds,
             "total_revenue": round(float(total_revenue), 2),
         }
 
@@ -573,6 +590,122 @@ def process_topup_request(req_id: int, approve: bool) -> Tuple[bool, str, Option
             result["status"] = new_status
             result["new_balance"] = new_balance
             return True, new_status, result
+        except Exception as exc:
+            conn.execute("ROLLBACK")
+            return False, f"error:{exc}", None
+
+
+# ----------------- Refund Request Operations -----------------
+def get_user_refunds(user_id: int) -> List[Dict[str, Any]]:
+    """All refund requests submitted by a user, newest first."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT r.*, p.name AS plan_name, c.name AS country_name
+            FROM refund_requests r
+            JOIN esims e ON e.id = r.esim_id
+            JOIN plans p ON p.id = e.plan_id
+            JOIN countries c ON c.id = p.country_id
+            WHERE r.user_id = ?
+            ORDER BY r.id DESC
+            """,
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def create_refund_request(
+    user_id: int,
+    esim_id: int,
+    reason: str,
+    video_file_id: str,
+    video_type: str = "video",
+    refund_amount: float = 0.0,
+) -> Optional[int]:
+    """
+    Creates a pending refund request. Returns the request id, or None when the
+    same eSIM already has a request still waiting for review (spam guard only;
+    previously reviewed requests do not block a new one).
+    """
+    with get_connection() as conn:
+        existing = conn.execute(
+            "SELECT id FROM refund_requests WHERE esim_id = ? AND status = 'pending'",
+            (esim_id,),
+        ).fetchone()
+        if existing:
+            return None
+        cur = conn.execute(
+            """
+            INSERT INTO refund_requests (user_id, esim_id, reason, video_file_id, video_type, refund_amount, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending')
+            """,
+            (user_id, esim_id, reason.strip(), video_file_id.strip(), video_type, round(float(refund_amount), 2)),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_refund_request(req_id: int) -> Optional[Dict[str, Any]]:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT r.*, u.username, u.full_name, u.balance,
+                   e.sold_price, e.item_type, p.name AS plan_name, c.name AS country_name
+            FROM refund_requests r
+            JOIN users u ON u.user_id = r.user_id
+            JOIN esims e ON e.id = r.esim_id
+            JOIN plans p ON p.id = e.plan_id
+            JOIN countries c ON c.id = p.country_id
+            WHERE r.id = ?
+            """,
+            (req_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_pending_refunds() -> List[Dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT r.*, u.username, u.full_name,
+                   p.name AS plan_name, c.name AS country_name
+            FROM refund_requests r
+            JOIN users u ON u.user_id = r.user_id
+            JOIN esims e ON e.id = r.esim_id
+            JOIN plans p ON p.id = e.plan_id
+            JOIN countries c ON c.id = p.country_id
+            WHERE r.status = 'pending'
+            ORDER BY r.id ASC
+            """,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_refund_reviewed(req_id: int) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    """
+    Marks a pending refund request as reviewed. This changes NO balances and
+    issues NO refunds; any compensation decision stays with the store owner
+    (for example via the existing manual balance tool).
+    Returns (success, status, request_dict).
+    """
+    with get_connection() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            req = conn.execute("SELECT * FROM refund_requests WHERE id = ?", (req_id,)).fetchone()
+            if not req:
+                conn.execute("ROLLBACK")
+                return False, "not_found", None
+            if req["status"] != "pending":
+                conn.execute("ROLLBACK")
+                return False, "already_processed", dict(req)
+            conn.execute(
+                "UPDATE refund_requests SET status = 'reviewed', reviewed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (req_id,),
+            )
+            conn.commit()
+            result = dict(req)
+            result["status"] = "reviewed"
+            return True, "reviewed", result
         except Exception as exc:
             conn.execute("ROLLBACK")
             return False, f"error:{exc}", None
