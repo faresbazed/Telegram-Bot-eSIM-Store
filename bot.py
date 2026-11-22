@@ -179,7 +179,7 @@ async def deliver_esim_to_chat(
         "3\ufe0f\u20e3 \u0627\u0645\u0633\u062d \u0643\u0648\u062f \u0627\u0644\u0640 QR \u0627\u0644\u0645\u0631\u0641\u0642 \u0623\u0648 \u0627\u0646\u0633\u062e \u0643\u0648\u062f \u0627\u0644\u0640 LPA \u0623\u0639\u0644\u0627\u0647 \u0648\u0623\u062f\u062e\u0644\u0647 \u064a\u062f\u0648\u064a\u0627\u064b.",
     ])
     caption = "\n".join(caption_lines)
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]])
+    kb = InlineKeyboardMarkup([[IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]])
 
     # Send QR photo (either stored QR image or dynamically generated from LPA)
     sent_photo = False
@@ -254,8 +254,8 @@ async def broadcast_new_inventory(
         "\U0001f447 <b>\u0627\u0636\u063a\u0637 \u0639\u0644\u0649 \u0627\u0644\u0632\u0631 \u0628\u0627\u0644\u0623\u0633\u0641\u0644 \u0644\u0634\u0631\u0627\u0621 \u0627\u0644\u0628\u0627\u0642\u0629 \u0641\u0648\u0631\u0627\u064b:</b>"
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("\U0001f6d2 \u0634\u0631\u0627\u0621 \u0647\u0630\u0647 \u0627\u0644\u0628\u0627\u0642\u0629 \u0627\u0644\u0622\u0646", callback_data=f"u_plan:{plan_id}")],
-        [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+        [IKB("\U0001f6d2 \u0634\u0631\u0627\u0621 \u0647\u0630\u0647 \u0627\u0644\u0628\u0627\u0642\u0629 \u0627\u0644\u0622\u0646", callback_data=f"u_plan:{plan_id}")],
+        [IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
     ])
 
     sent = 0
@@ -357,21 +357,51 @@ async def send_refund_video_to_admin(
 # ==============================================================================
 # Main Menus (User & Admin)
 # ==============================================================================
+
+# Colored inline buttons: Bot API 9.4 (Feb 9, 2026) added `style` to
+# InlineKeyboardButton; PTB 21.6 predates the field, so it goes via api_kwargs.
+_InlineKeyboardButtonBase = InlineKeyboardButton
+
+
+def _infer_button_style(text, callback_data=None, url=None):
+    t = text or ""
+    if any(k in t for k in ("\u274c", "\u26d4", "\U0001f6ab", "\U0001f5d1",
+                            "\u0625\u0644\u063a\u0627\u0621", "\u0631\u0641\u0636",
+                            "\u062d\u0630\u0641", "\u062d\u0638\u0631")):
+        return "danger"
+    if any(k in t for k in ("\u2705", "\u2714", "\U0001f6d2", "\U0001f4b3", "\u2795",
+                            "\u062a\u0623\u0643\u064a\u062f", "\u0645\u0648\u0627\u0641\u0642\u0629",
+                            "\u0634\u062d\u0646", "\u0634\u0631\u0627\u0621")):
+        return "success"
+    return "primary"
+
+
+def IKB(text, callback_data=None, url=None, style=None, **kwargs):
+    """InlineKeyboardButton with an explicit Bot API `style` color."""
+    if style is None:
+        style = _infer_button_style(text, callback_data, url)
+    api_kwargs = dict(kwargs.pop("api_kwargs", None) or {})
+    api_kwargs["style"] = style
+    return _InlineKeyboardButtonBase(
+        text, url=url, callback_data=callback_data, api_kwargs=api_kwargs, **kwargs
+    )
+
+
 def build_home_keyboard(user_id: int) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("\U0001f6d2 \u0634\u0631\u0627\u0621 \u0634\u0631\u064a\u062d\u0629 eSIM", callback_data="u_countries")],
+        [IKB("\U0001f6d2 \u0634\u0631\u0627\u0621 \u0634\u0631\u064a\u062d\u0629 eSIM", callback_data="u_countries")],
         [
-            InlineKeyboardButton("\U0001f4b3 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f", callback_data="u_topup"),
-            InlineKeyboardButton("\U0001f4b0 \u0631\u0635\u064a\u062f\u064a \u0648\u062d\u0633\u0627\u0628\u064a", callback_data="u_account"),
+            IKB("\U0001f4b3 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f", callback_data="u_topup"),
+            IKB("\U0001f4b0 \u0631\u0635\u064a\u062f\u064a \u0648\u062d\u0633\u0627\u0628\u064a", callback_data="u_account"),
         ],
         [
-            InlineKeyboardButton("\U0001f4e6 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a \u0627\u0644\u0633\u0627\u0628\u0642\u0629", callback_data="u_purchases"),
-            InlineKeyboardButton("\u21a9\ufe0f \u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f", callback_data="u_refund"),
+            IKB("\U0001f4e6 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a \u0627\u0644\u0633\u0627\u0628\u0642\u0629", callback_data="u_purchases"),
+            IKB("\u21a9\ufe0f \u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f", callback_data="u_refund"),
         ],
-        [InlineKeyboardButton("\U0001f6df \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a", callback_data="u_support")],
+        [IKB("\U0001f6df \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a", callback_data="u_support")],
     ]
     if is_admin(user_id):
-        rows.append([InlineKeyboardButton("\U0001f6e0 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646 (\u0627\u0644\u0645\u0627\u0644\u0643)", callback_data="adm_home")])
+        rows.append([IKB("\U0001f6e0 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646 (\u0627\u0644\u0645\u0627\u0644\u0643)", callback_data="adm_home")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -481,13 +511,23 @@ class _ReplyMenuQuery:
         return await self._message.reply_text(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
 
 
+class _ReplyMenuUpdate:
+    """Read-through proxy around a real Update exposing a synthetic
+    callback_query. PTB Update attributes are frozen, so the real update
+    cannot be mutated; handlers only read attributes off the proxy."""
+
+    def __init__(self, update: Update, query) -> None:
+        self._update = update
+        self.callback_query = query
+
+    def __getattr__(self, name):
+        return getattr(self._update, name)
+
+
 async def route_reply_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str) -> None:
     """Dispatch a bottom-menu press through the existing callback router."""
-    update.callback_query = _ReplyMenuQuery(update.message, action)
-    try:
-        await callback_router(update, context)
-    finally:
-        update.callback_query = None
+    proxy = _ReplyMenuUpdate(update, _ReplyMenuQuery(update.message, action))
+    await callback_router(proxy, context)
 
 
 async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -508,7 +548,10 @@ async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"\U0001f4b0 <b>\u0631\u0635\u064a\u062f\u0643 \u0627\u0644\u062d\u0627\u0644\u064a:</b> <code>{float(u_row['balance']):.2f}</code> {html.escape(currency)}\n\n"
         "\U0001f447 <b>\u0627\u062e\u062a\u0631 \u0645\u0646 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062a\u0627\u0644\u064a\u0629 \u0645\u0627 \u064a\u0646\u0627\u0633\u0628\u0643:</b>"
     )
-    await safe_edit_or_send(update, text, build_home_keyboard(user.id))
+    if update.callback_query:
+        await safe_edit_or_send(update, text)
+    else:
+        await safe_edit_or_send(update, text, build_reply_keyboard(user.id))
 
 
 async def show_admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -536,32 +579,32 @@ async def show_admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("\U0001f30d \u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u062f\u0648\u0644", callback_data="adm_countries"),
-            InlineKeyboardButton("\U0001f4e6 \u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0628\u0627\u0642\u0627\u062a", callback_data="adm_plans_SelectCountry"),
+            IKB("\U0001f30d \u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u062f\u0648\u0644", callback_data="adm_countries"),
+            IKB("\U0001f4e6 \u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0628\u0627\u0642\u0627\u062a", callback_data="adm_plans_SelectCountry"),
         ],
         [
-            InlineKeyboardButton("\U0001f4f2 \u0625\u062f\u0627\u0631\u0629 \u0645\u062e\u0632\u0648\u0646 \u0627\u0644\u0634\u0631\u0627\u0626\u062d (eSIMs)", callback_data="adm_inv_SelectCountry"),
+            IKB("\U0001f4f2 \u0625\u062f\u0627\u0631\u0629 \u0645\u062e\u0632\u0648\u0646 \u0627\u0644\u0634\u0631\u0627\u0626\u062d (eSIMs)", callback_data="adm_inv_SelectCountry"),
         ],
         [
-            InlineKeyboardButton(
+            IKB(
                 f"\U0001f4b3 \u0637\u0644\u0628\u0627\u062a \u0627\u0644\u0634\u062d\u0646 \u0648\u0627\u0644\u0623\u0631\u0635\u062f\u0629 ({stats['pending_topups']})",
                 callback_data="adm_topups_menu",
             ),
         ],
         [
-            InlineKeyboardButton(
+            IKB(
                 f"\u21a9\ufe0f \u0637\u0644\u0628\u0627\u062a \u0627\u0644\u0627\u0633\u062a\u0631\u062f\u0627\u062f ({stats['pending_refunds']})",
                 callback_data="adm_refunds_menu",
             ),
         ],
         [
-            InlineKeyboardButton("\U0001f465 \u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u064a\u0646 \u0648\u0627\u0644\u062d\u0638\u0631", callback_data="adm_users_menu"),
-            InlineKeyboardButton("\U0001f4e2 \u0631\u0633\u0627\u0644\u0629 \u062c\u0645\u0627\u0639\u064a\u0629 \u0644\u0644\u0643\u0644", callback_data="adm_broadcast_start"),
+            IKB("\U0001f465 \u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u064a\u0646 \u0648\u0627\u0644\u062d\u0638\u0631", callback_data="adm_users_menu"),
+            IKB("\U0001f4e2 \u0631\u0633\u0627\u0644\u0629 \u062c\u0645\u0627\u0639\u064a\u0629 \u0644\u0644\u0643\u0644", callback_data="adm_broadcast_start"),
         ],
         [
-            InlineKeyboardButton("\u2699\ufe0f \u0625\u0639\u062f\u0627\u062f\u0627\u062a \u0627\u0644\u062f\u0641\u0639 \u0648\u0627\u0644\u062f\u0639\u0645", callback_data="adm_settings"),
+            IKB("\u2699\ufe0f \u0625\u0639\u062f\u0627\u062f\u0627\u062a \u0627\u0644\u062f\u0641\u0639 \u0648\u0627\u0644\u062f\u0639\u0645", callback_data="adm_settings"),
         ],
-        [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0648\u0627\u062c\u0647\u0629 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645", callback_data="home")],
+        [IKB("\U0001f3e0 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0648\u0627\u062c\u0647\u0629 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645", callback_data="home")],
     ])
     await safe_edit_or_send(update, text, kb)
 
@@ -626,9 +669,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"\U0001f4e6 <b>\u0625\u062c\u0645\u0627\u0644\u064a \u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0627\u0644\u0645\u0634\u062a\u0631\u0627\u0629:</b> {len(purchases)} \u0634\u0631\u064a\u062d\u0629\n"
         )
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("\U0001f4b3 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0627\u0644\u0622\u0646", callback_data="u_topup")],
-            [InlineKeyboardButton("\U0001f4e6 \u0639\u0631\u0636 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a", callback_data="u_purchases")],
-            [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+            [IKB("\U0001f4b3 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0627\u0644\u0622\u0646", callback_data="u_topup")],
+            [IKB("\U0001f4e6 \u0639\u0631\u0636 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a", callback_data="u_purchases")],
+            [IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
         ])
         await safe_edit_or_send(update, text, kb)
         return
@@ -644,8 +687,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"\U0001f194 <b>\u0645\u0639\u0631\u0641 \u062d\u0633\u0627\u0628\u0643 \u0644\u062a\u0632\u0648\u064a\u062f \u0627\u0644\u062f\u0639\u0645 \u0628\u0647:</b> <code>{user.id}</code>"
         )
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("\U0001f4ac \u0645\u0631\u0627\u0633\u0644\u0629 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a \u0645\u0628\u0627\u0634\u0631\u0629", url=f"https://t.me/{support_user}")],
-            [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+            [IKB("\U0001f4ac \u0645\u0631\u0627\u0633\u0644\u0629 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a \u0645\u0628\u0627\u0634\u0631\u0629", url=f"https://t.me/{support_user}")],
+            [IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
         ])
         await safe_edit_or_send(update, text, kb)
         return
@@ -660,7 +703,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                 "\u26a0\ufe0f \u0644\u0627 \u062a\u0648\u062c\u062f \u062f\u0648\u0644 \u0645\u0636\u0627\u0641\u0629 \u062d\u0627\u0644\u064a\u0627\u064b \u0641\u064a \u0627\u0644\u0645\u062a\u062c\u0631. \u064a\u0631\u062c\u0649 \u0627\u0644\u0645\u062d\u0627\u0648\u0644\u0629 \u0644\u0627\u062d\u0642\u0627\u064b."
             )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]])
+            kb = InlineKeyboardMarkup([[IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -669,12 +712,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             stock = int(c["available_stock"] or 0)
             badge = f"\u2705 ({stock})" if stock > 0 else "\u274c \u0646\u0641\u062f"
             rows.append([
-                InlineKeyboardButton(
+                IKB(
                     f"{c['name']} \u2014 {badge}",
                     callback_data=f"u_country:{c['id']}",
                 )
             ])
-        rows.append([InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
+        rows.append([IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
         text = (
             "\U0001f30d <b>\u0627\u062e\u062a\u0631 \u0627\u0644\u062f\u0648\u0644\u0629 \u0627\u0644\u062a\u064a \u062a\u0631\u063a\u0628 \u0628\u0634\u0631\u0627\u0621 \u0634\u0631\u064a\u062d\u0629 eSIM \u0644\u0647\u0627:</b>\n"
             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -698,8 +741,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "\u26a0\ufe0f \u0644\u0627 \u062a\u0648\u062c\u062f \u0628\u0627\u0642\u0627\u062a \u0645\u0636\u0627\u0641\u0629 \u0644\u0647\u0630\u0647 \u0627\u0644\u062f\u0648\u0644\u0629 \u062d\u0627\u0644\u064a\u0627\u064b."
             )
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062f\u0648\u0644", callback_data="u_countries")],
-                [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+                [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062f\u0648\u0644", callback_data="u_countries")],
+                [IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
             ])
             await safe_edit_or_send(update, text, kb)
             return
@@ -709,13 +752,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             avail = int(p["available_count"] or 0)
             status_str = f"\u0645\u062a\u0627\u062d ({avail})" if avail > 0 else "\u0646\u0641\u062f\u062a \u0627\u0644\u0643\u0645\u064a\u0629"
             rows.append([
-                InlineKeyboardButton(
+                IKB(
                     f"\U0001f4e6 {p['name']} | {float(p['price']):.2f} {currency} ({status_str})",
                     callback_data=f"u_plan:{p['id']}",
                 )
             ])
-        rows.append([InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062f\u0648\u0644", callback_data="u_countries")])
-        rows.append([InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
+        rows.append([IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062f\u0648\u0644", callback_data="u_countries")])
+        rows.append([IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
         text = (
             f"\U0001f30d <b>\u0628\u0627\u0642\u0627\u062a \u0634\u0631\u0627\u0626\u062d eSIM \u0644\u062f\u0648\u0644\u0629: {html.escape(country['name'])}</b>\n"
             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -753,7 +796,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if avail > 0:
             if balance >= price:
                 rows.append([
-                    InlineKeyboardButton(
+                    IKB(
                         f"\u2705 \u062a\u0623\u0643\u064a\u062f \u0627\u0644\u0634\u0631\u0627\u0621 ({price:.2f} {currency})",
                         callback_data=f"u_buy_confirm:{plan_id}",
                     )
@@ -761,9 +804,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             else:
                 diff = round(price - balance, 2)
                 text += f"\n\n\u26a0\ufe0f <b>\u0631\u0635\u064a\u062f\u0643 \u063a\u064a\u0631 \u0643\u0627\u0641\u064d \u0644\u0625\u062a\u0645\u0627\u0645 \u0627\u0644\u0634\u0631\u0627\u0621. \u062a\u062d\u062a\u0627\u062c \u0625\u0644\u0649 \u0634\u062d\u0646 <code>{diff:.2f}</code> {html.escape(currency)} \u0625\u0636\u0627\u0641\u064a\u0629.</b>"
-                rows.append([InlineKeyboardButton("\U0001f4b3 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0627\u0644\u0622\u0646", callback_data="u_topup")])
-        rows.append([InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0628\u0627\u0642\u0627\u062a \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"u_country:{plan['country_id']}")])
-        rows.append([InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
+                rows.append([IKB("\U0001f4b3 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0627\u0644\u0622\u0646", callback_data="u_topup")])
+        rows.append([IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0628\u0627\u0642\u0627\u062a \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"u_country:{plan['country_id']}")])
+        rows.append([IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
         await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
         return
 
@@ -802,8 +845,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "\u0644\u0645 \u062a\u0642\u0645 \u0628\u0634\u0631\u0627\u0621 \u0623\u064a \u0634\u0631\u064a\u062d\u0629 eSIM \u062d\u062a\u0649 \u0627\u0644\u0622\u0646."
             )
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("\U0001f6d2 \u062a\u0635\u0641\u062d \u0627\u0644\u062f\u0648\u0644 \u0648\u0627\u0644\u0628\u0627\u0642\u0627\u062a", callback_data="u_countries")],
-                [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+                [IKB("\U0001f6d2 \u062a\u0635\u0641\u062d \u0627\u0644\u062f\u0648\u0644 \u0648\u0627\u0644\u0628\u0627\u0642\u0627\u062a", callback_data="u_countries")],
+                [IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
             ])
             await safe_edit_or_send(update, text, kb)
             return
@@ -811,12 +854,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         rows = []
         for item in purchases[:20]:
             rows.append([
-                InlineKeyboardButton(
+                IKB(
                     f"\U0001f4f2 #{item['id']} | {item['country_name']} - {item['plan_name']} ({float(item['sold_price'] or 0):.2f} {currency})",
                     callback_data=f"u_view_esim:{item['id']}",
                 )
             ])
-        rows.append([InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
+        rows.append([IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
         text = (
             "\U0001f4e6 <b>\u0633\u062c\u0644 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a \u0645\u0646 \u0634\u0631\u0627\u0626\u062d eSIM</b>\n"
             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -862,8 +905,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 + requests_lines
             )
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("\U0001f6d2 \u062a\u0635\u0641\u062d \u0627\u0644\u062f\u0648\u0644 \u0648\u0627\u0644\u0628\u0627\u0642\u0627\u062a", callback_data="u_countries")],
-                [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+                [IKB("\U0001f6d2 \u062a\u0635\u0641\u062d \u0627\u0644\u062f\u0648\u0644 \u0648\u0627\u0644\u0628\u0627\u0642\u0627\u062a", callback_data="u_countries")],
+                [IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
             ])
             await safe_edit_or_send(update, text, kb)
             return
@@ -871,12 +914,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         rows = []
         for item in purchases[:20]:
             rows.append([
-                InlineKeyboardButton(
+                IKB(
                     f"\U0001f4f2 #{item['id']} | {item['country_name']} - {item['plan_name']} ({float(item['sold_price'] or 0):.2f} {currency})",
                     callback_data=f"u_refund_esim:{item['id']}",
                 )
             ])
-        rows.append([InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
+        rows.append([IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
         text = (
             "\u21a9\ufe0f <b>\u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f</b>\n"
             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -905,7 +948,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "1\ufe0f\u20e3 <b>\u0627\u0644\u062e\u0637\u0648\u0629 \u0627\u0644\u0623\u0648\u0644\u0649:</b> \u0627\u0643\u062a\u0628 \u0627\u0644\u0622\u0646 <b>\u0648\u0635\u0641\u0627\u064b \u0645\u062e\u062a\u0635\u0631\u0627\u064b \u0644\u0644\u0645\u0634\u0643\u0644\u0629</b> \u0641\u064a \u0631\u0633\u0627\u0644\u0629 \u0646\u0635\u064a\u0629 "
             "(\u0645\u062b\u0627\u0644: <code>\u0643\u0648\u062f QR \u0644\u0627 \u064a\u0639\u0645\u0644</code> \u0623\u0648 <code>\u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0645\u0641\u0639\u0644\u0629 \u0645\u0633\u0628\u0642\u0627\u064b</code>):"
         )
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0625\u0644\u063a\u0627\u0621 \u0627\u0644\u0637\u0644\u0628", callback_data="u_refund")]])
+        kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621 \u0627\u0644\u0637\u0644\u0628", callback_data="u_refund")]])
         await safe_edit_or_send(update, text, kb)
         return
 
@@ -921,9 +964,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "\U0001f7e3 <b>InstaPay EG (\u0625\u0646\u0633\u062a\u0627 \u0628\u0627\u064a \u0645\u0635\u0631)</b>"
         )
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("\U0001f7e1 \u0627\u0644\u062f\u0641\u0639 \u0639\u0628\u0631 Binance ID (\u0639\u0645\u0644\u0627\u062a \u0631\u0642\u0645\u064a\u0629)", callback_data="u_topup_m:binance")],
-            [InlineKeyboardButton("\U0001f7e3 \u0627\u0644\u062f\u0641\u0639 \u0639\u0628\u0631 InstaPay EG (\u0625\u0646\u0633\u062a\u0627 \u0628\u0627\u064a)", callback_data="u_topup_m:instapay")],
-            [InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+            [IKB("\U0001f7e1 \u0627\u0644\u062f\u0641\u0639 \u0639\u0628\u0631 Binance ID (\u0639\u0645\u0644\u0627\u062a \u0631\u0642\u0645\u064a\u0629)", callback_data="u_topup_m:binance")],
+            [IKB("\U0001f7e3 \u0627\u0644\u062f\u0641\u0639 \u0639\u0628\u0631 InstaPay EG (\u0625\u0646\u0633\u062a\u0627 \u0628\u0627\u064a)", callback_data="u_topup_m:instapay")],
+            [IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
         ])
         await safe_edit_or_send(update, text, kb)
         return
@@ -953,8 +996,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"2\ufe0f\u20e3 \u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0642\u064a\u0645\u0629 \u0627\u0644\u0645\u0628\u0644\u063a \u0627\u0644\u0645\u0631\u0627\u062f \u0634\u062d\u0646\u0647 ({html.escape(currency)})</b> \u0641\u064a \u0631\u0633\u0627\u0644\u0629 \u0646\u0635\u064a\u0629 \u0628\u0627\u0644\u0623\u0633\u0641\u0644 (\u0645\u062b\u0627\u0644: <code>10</code> \u0623\u0648 <code>25.5</code>):"
         )
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("\U0001f519 \u062a\u063a\u064a\u064a\u0631 \u0648\u0633\u064a\u0644\u0629 \u0627\u0644\u062f\u0641\u0639", callback_data="u_topup")],
-            [InlineKeyboardButton("\U0001f3e0 \u0625\u0644\u063a\u0627\u0621 \u0648\u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+            [IKB("\U0001f519 \u062a\u063a\u064a\u064a\u0631 \u0648\u0633\u064a\u0644\u0629 \u0627\u0644\u062f\u0641\u0639", callback_data="u_topup")],
+            [IKB("\U0001f3e0 \u0625\u0644\u063a\u0627\u0621 \u0648\u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
         ])
         await safe_edit_or_send(update, text, kb)
         return
@@ -977,15 +1020,15 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.answer()
             clear_state(context)
             countries = db.get_countries()
-            rows = [[InlineKeyboardButton("\u2795 \u0625\u0636\u0627\u0641\u0629 \u062f\u0648\u0644\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data="adm_country_add")]]
+            rows = [[IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u062f\u0648\u0644\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data="adm_country_add")]]
             for c in countries:
                 rows.append([
-                    InlineKeyboardButton(
+                    IKB(
                         f"\U0001f30d {c['name']} (\u0627\u0644\u0628\u0627\u0642\u0627\u062a: {c['plans_count']} | \u0627\u0644\u0645\u062e\u0632\u0648\u0646: {int(c['available_stock'] or 0)})",
                         callback_data=f"adm_country_view:{c['id']}",
                     )
                 ])
-            rows.append([InlineKeyboardButton("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
+            rows.append([IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
             text = (
                 "\U0001f30d <b>\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u062f\u0648\u0644</b>\n"
                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -1002,7 +1045,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                 "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 \u0627\u0633\u0645 \u0627\u0644\u062f\u0648\u0644\u0629 \u0645\u0639 \u0627\u0644\u0639\u0644\u0645 (\u0645\u062b\u0627\u0644: <code>\U0001f1f9\U0001f1f7 \u062a\u0631\u0643\u064a\u0627</code> \u0623\u0648 <code>\U0001f1f8\U0001f1e6 \u0627\u0644\u0633\u0639\u0648\u062f\u064a\u0629</code>):"
             )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_countries")]])
+            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_countries")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1022,10 +1065,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "\u0627\u062e\u062a\u0631 \u0627\u0644\u0625\u062c\u0631\u0627\u0621 \u0627\u0644\u0645\u0637\u0644\u0648\u0628:"
             )
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("\U0001f4e6 \u0625\u062f\u0627\u0631\u0629 \u0628\u0627\u0642\u0627\u062a \u0647\u0630\u0647 \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plans_country:{country_id}")],
-                [InlineKeyboardButton("\u270f\ufe0f \u062a\u0639\u062f\u064a\u0644 \u0627\u0633\u0645 \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_country_edit:{country_id}")],
-                [InlineKeyboardButton("\U0001f5d1\ufe0f \u062d\u0630\u0641 \u0627\u0644\u062f\u0648\u0644\u0629 \u0628\u0627\u0644\u0643\u0627\u0645\u0644", callback_data=f"adm_country_del:{country_id}")],
-                [InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062f\u0648\u0644", callback_data="adm_countries")],
+                [IKB("\U0001f4e6 \u0625\u062f\u0627\u0631\u0629 \u0628\u0627\u0642\u0627\u062a \u0647\u0630\u0647 \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plans_country:{country_id}")],
+                [IKB("\u270f\ufe0f \u062a\u0639\u062f\u064a\u0644 \u0627\u0633\u0645 \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_country_edit:{country_id}")],
+                [IKB("\U0001f5d1\ufe0f \u062d\u0630\u0641 \u0627\u0644\u062f\u0648\u0644\u0629 \u0628\u0627\u0644\u0643\u0627\u0645\u0644", callback_data=f"adm_country_del:{country_id}")],
+                [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062f\u0648\u0644", callback_data="adm_countries")],
             ])
             await safe_edit_or_send(update, text, kb)
             return
@@ -1043,7 +1086,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                 "\u0623\u0631\u0633\u0644 \u0627\u0644\u0627\u0633\u0645 \u0627\u0644\u062c\u062f\u064a\u062f \u0644\u0644\u062f\u0648\u0644\u0629 \u0627\u0644\u0622\u0646:"
             )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data=f"adm_country_view:{country_id}")]])
+            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data=f"adm_country_view:{country_id}")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1053,15 +1096,15 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.answer("\U0001f5d1\ufe0f \u062a\u0645 \u062d\u0630\u0641 \u0627\u0644\u062f\u0648\u0644\u0629 \u0648\u0628\u0627\u0642\u0627\u062a\u0647\u0627 \u0628\u0646\u062c\u0627\u062d!", show_alert=True)
             # Return to countries list
             countries = db.get_countries()
-            rows = [[InlineKeyboardButton("\u2795 \u0625\u0636\u0627\u0641\u0629 \u062f\u0648\u0644\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data="adm_country_add")]]
+            rows = [[IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u062f\u0648\u0644\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data="adm_country_add")]]
             for c in countries:
                 rows.append([
-                    InlineKeyboardButton(
+                    IKB(
                         f"\U0001f30d {c['name']} (\u0627\u0644\u0628\u0627\u0642\u0627\u062a: {c['plans_count']} | \u0627\u0644\u0645\u062e\u0632\u0648\u0646: {int(c['available_stock'] or 0)})",
                         callback_data=f"adm_country_view:{c['id']}",
                     )
                 ])
-            rows.append([InlineKeyboardButton("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
+            rows.append([IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
             await safe_edit_or_send(update, "\u2705 <b>\u062a\u0645 \u062d\u0630\u0641 \u0627\u0644\u062f\u0648\u0644\u0629 \u0628\u0646\u062c\u0627\u062d.</b>\n\n\U0001f30d <b>\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u062f\u0648\u0644:</b>", InlineKeyboardMarkup(rows))
             return
 
@@ -1075,16 +1118,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     update,
                     "\u26a0\ufe0f <b>\u0644\u0627 \u062a\u0648\u062c\u062f \u062f\u0648\u0644 \u0645\u0636\u0627\u0641\u0629 \u0628\u0639\u062f. \u0642\u0645 \u0628\u0625\u0636\u0627\u0641\u0629 \u062f\u0648\u0644\u0629 \u0623\u0648\u0644\u0627\u064b \u062b\u0645 \u0623\u0636\u0641 \u0628\u0627\u0642\u0627\u062a\u0647\u0627.</b>",
                     InlineKeyboardMarkup([
-                        [InlineKeyboardButton("\u2795 \u0625\u0636\u0627\u0641\u0629 \u062f\u0648\u0644\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data="adm_country_add")],
-                        [InlineKeyboardButton("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")],
+                        [IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u062f\u0648\u0644\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data="adm_country_add")],
+                        [IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")],
                     ]),
                 )
                 return
             rows = [
-                [InlineKeyboardButton(f"\U0001f30d {c['name']} ({c['plans_count']} \u0628\u0627\u0642\u0629)", callback_data=f"adm_plans_country:{c['id']}")]
+                [IKB(f"\U0001f30d {c['name']} ({c['plans_count']} \u0628\u0627\u0642\u0629)", callback_data=f"adm_plans_country:{c['id']}")]
                 for c in countries
             ]
-            rows.append([InlineKeyboardButton("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
+            rows.append([IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
             await safe_edit_or_send(
                 update,
                 "\U0001f4e6 <b>\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0628\u0627\u0642\u0627\u062a</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u0627\u062e\u062a\u0631 \u0627\u0644\u062f\u0648\u0644\u0629 \u0644\u0625\u062f\u0627\u0631\u0629 \u0628\u0627\u0642\u0627\u062a\u0647\u0627:",
@@ -1100,16 +1143,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if not country:
                 return
             plans = db.get_plans_by_country(country_id)
-            rows = [[InlineKeyboardButton("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0628\u0627\u0642\u0629 \u062c\u062f\u064a\u062f\u0629 \u0644\u0647\u0630\u0647 \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plan_add:{country_id}")]]
+            rows = [[IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0628\u0627\u0642\u0629 \u062c\u062f\u064a\u062f\u0629 \u0644\u0647\u0630\u0647 \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plan_add:{country_id}")]]
             for p in plans:
                 rows.append([
-                    InlineKeyboardButton(
+                    IKB(
                         f"\U0001f4e6 {p['name']} \u2014 {float(p['price']):.2f} {currency} (\u0627\u0644\u0645\u062a\u0627\u062d: {int(p['available_count'] or 0)})",
                         callback_data=f"adm_plan_view:{p['id']}",
                     )
                 ])
-            rows.append([InlineKeyboardButton("\U0001f519 \u0627\u062e\u062a\u064a\u0627\u0631 \u062f\u0648\u0644\u0629 \u0623\u062e\u0631\u0649", callback_data="adm_plans_SelectCountry")])
-            rows.append([InlineKeyboardButton("\U0001f6e0 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
+            rows.append([IKB("\U0001f519 \u0627\u062e\u062a\u064a\u0627\u0631 \u062f\u0648\u0644\u0629 \u0623\u062e\u0631\u0649", callback_data="adm_plans_SelectCountry")])
+            rows.append([IKB("\U0001f6e0 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
             text = (
                 f"\U0001f4e6 <b>\u0628\u0627\u0642\u0627\u062a \u062f\u0648\u0644\u0629: {html.escape(country['name'])}</b>\n"
                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -1128,7 +1171,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                 "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0627\u0633\u0645 \u0627\u0644\u0628\u0627\u0642\u0629</b> (\u0645\u062b\u0627\u0644: <code>\u0628\u0627\u0642\u0629 10 \u062c\u064a\u062c\u0627\u0628\u0627\u064a\u062a - 30 \u064a\u0648\u0645</code>):"
             )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data=f"adm_plans_country:{country_id}")]])
+            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data=f"adm_plans_country:{country_id}")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1148,11 +1191,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 f"\U0001f4f2 <b>\u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0627\u0644\u0645\u062a\u0627\u062d\u0629 \u0628\u0627\u0644\u0645\u062e\u0632\u0648\u0646:</b> {int(plan['available_count'] or 0)} \u0634\u0631\u064a\u062d\u0629"
             )
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0634\u0631\u0627\u0626\u062d eSIM (LPA \u0623\u0648 QR)", callback_data=f"adm_esim_add:{plan_id}")],
-                [InlineKeyboardButton("\U0001f4cb \u0639\u0631\u0636 \u0648\u062a\u0639\u062f\u064a\u0644/\u062d\u0630\u0641 \u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0628\u0627\u0644\u0645\u062e\u0632\u0648\u0646", callback_data=f"adm_esim_list:{plan_id}")],
-                [InlineKeyboardButton("\u270f\ufe0f \u062a\u0639\u062f\u064a\u0644 \u0628\u064a\u0627\u0646\u0627\u062a \u0648\u0633\u0639\u0631 \u0627\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_edit:{plan_id}")],
-                [InlineKeyboardButton("\U0001f5d1\ufe0f \u062d\u0630\u0641 \u0627\u0644\u0628\u0627\u0642\u0629 \u0646\u0647\u0627\u0626\u064a\u0627\u064b", callback_data=f"adm_plan_del:{plan_id}")],
-                [InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0628\u0627\u0642\u0627\u062a \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plans_country:{plan['country_id']}")],
+                [IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0634\u0631\u0627\u0626\u062d eSIM (LPA \u0623\u0648 QR)", callback_data=f"adm_esim_add:{plan_id}")],
+                [IKB("\U0001f4cb \u0639\u0631\u0636 \u0648\u062a\u0639\u062f\u064a\u0644/\u062d\u0630\u0641 \u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0628\u0627\u0644\u0645\u062e\u0632\u0648\u0646", callback_data=f"adm_esim_list:{plan_id}")],
+                [IKB("\u270f\ufe0f \u062a\u0639\u062f\u064a\u0644 \u0628\u064a\u0627\u0646\u0627\u062a \u0648\u0633\u0639\u0631 \u0627\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_edit:{plan_id}")],
+                [IKB("\U0001f5d1\ufe0f \u062d\u0630\u0641 \u0627\u0644\u0628\u0627\u0642\u0629 \u0646\u0647\u0627\u0626\u064a\u0627\u064b", callback_data=f"adm_plan_del:{plan_id}")],
+                [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0628\u0627\u0642\u0627\u062a \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plans_country:{plan['country_id']}")],
             ])
             await safe_edit_or_send(update, text, kb)
             return
@@ -1170,7 +1213,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                 "\u0623\u0631\u0633\u0644 <b>\u0627\u0644\u0627\u0633\u0645 \u0627\u0644\u062c\u062f\u064a\u062f \u0644\u0644\u0628\u0627\u0642\u0629</b> (\u0623\u0648 \u0623\u0631\u0633\u0644 \u0646\u0642\u0637\u0629 <code>.</code> \u0644\u0644\u0625\u0628\u0642\u0627\u0621 \u0639\u0644\u0649 \u0627\u0644\u0627\u0633\u0645 \u0627\u0644\u062d\u0627\u0644\u064a):"
             )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data=f"adm_plan_view:{plan_id}")]])
+            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data=f"adm_plan_view:{plan_id}")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1184,7 +1227,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await safe_edit_or_send(
                     update,
                     "\u2705 <b>\u062a\u0645 \u062d\u0630\u0641 \u0627\u0644\u0628\u0627\u0642\u0629 \u0628\u0646\u062c\u0627\u062d.</b>",
-                    InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0628\u0627\u0642\u0627\u062a \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plans_country:{country_id}")]]),
+                    InlineKeyboardMarkup([[IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0628\u0627\u0642\u0627\u062a \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plans_country:{country_id}")]]),
                 )
             else:
                 await show_admin_home(update, context)
@@ -1199,19 +1242,19 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await safe_edit_or_send(
                     update,
                     "\u26a0\ufe0f <b>\u0644\u0627 \u062a\u0648\u062c\u062f \u062f\u0648\u0644 \u0645\u0636\u0627\u0641\u0629 \u0628\u0639\u062f. \u0642\u0645 \u0628\u0625\u0636\u0627\u0641\u0629 \u062f\u0648\u0644\u0629 \u0648\u0628\u0627\u0642\u0629 \u0623\u0648\u0644\u0627\u064b.</b>",
-                    InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")]]),
+                    InlineKeyboardMarkup([[IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")]]),
                 )
                 return
             rows = [
                 [
-                    InlineKeyboardButton(
+                    IKB(
                         f"\U0001f30d {c['name']} (\u0627\u0644\u0645\u062a\u0627\u062d \u0628\u0627\u0644\u0645\u062e\u0632\u0648\u0646: {int(c['available_stock'] or 0)})",
                         callback_data=f"adm_inv_country:{c['id']}",
                     )
                 ]
                 for c in countries
             ]
-            rows.append([InlineKeyboardButton("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
+            rows.append([IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
             await safe_edit_or_send(
                 update,
                 "\U0001f4f2 <b>\u0625\u062f\u0627\u0631\u0629 \u0645\u062e\u0632\u0648\u0646 \u0627\u0644\u0634\u0631\u0627\u0626\u062d (eSIMs)</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u0627\u062e\u062a\u0631 \u0627\u0644\u062f\u0648\u0644\u0629 \u0644\u0639\u0631\u0636 \u0628\u0627\u0642\u0627\u062a\u0647\u0627 \u0648\u0625\u062f\u0627\u0631\u0629 \u0634\u0631\u0627\u0626\u062d\u0647\u0627:",
@@ -1229,20 +1272,20 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     update,
                     f"\u26a0\ufe0f <b>\u0644\u0627 \u062a\u0648\u062c\u062f \u0628\u0627\u0642\u0627\u062a \u0641\u064a \u062f\u0648\u0644\u0629 {html.escape(country['name'] if country else '')}. \u0623\u0636\u0641 \u0628\u0627\u0642\u0629 \u0623\u0648\u0644\u0627\u064b.</b>",
                     InlineKeyboardMarkup([
-                        [InlineKeyboardButton("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0628\u0627\u0642\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data=f"adm_plan_add:{country_id}")],
-                        [InlineKeyboardButton("\U0001f519 \u0631\u062c\u0648\u0639", callback_data="adm_inv_SelectCountry")],
+                        [IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0628\u0627\u0642\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data=f"adm_plan_add:{country_id}")],
+                        [IKB("\U0001f519 \u0631\u062c\u0648\u0639", callback_data="adm_inv_SelectCountry")],
                     ]),
                 )
                 return
             rows = []
             for p in plans:
                 rows.append([
-                    InlineKeyboardButton(
+                    IKB(
                         f"\U0001f4e6 {p['name']} (\u0627\u0644\u0645\u062a\u0648\u0641\u0631: {int(p['available_count'] or 0)} \u0634\u0631\u064a\u062d\u0629)",
                         callback_data=f"adm_plan_view:{p['id']}",
                     )
                 ])
-            rows.append([InlineKeyboardButton("\U0001f519 \u0627\u062e\u062a\u064a\u0627\u0631 \u062f\u0648\u0644\u0629 \u0623\u062e\u0631\u0649", callback_data="adm_inv_SelectCountry")])
+            rows.append([IKB("\U0001f519 \u0627\u062e\u062a\u064a\u0627\u0631 \u062f\u0648\u0644\u0629 \u0623\u062e\u0631\u0649", callback_data="adm_inv_SelectCountry")])
             await safe_edit_or_send(
                 update,
                 f"\U0001f4f2 <b>\u0627\u062e\u062a\u0631 \u0627\u0644\u0628\u0627\u0642\u0629 \u0644\u0625\u062f\u0627\u0631\u0629 \u0645\u062e\u0632\u0648\u0646 \u0627\u0644\u0634\u0631\u0627\u0626\u062d ({html.escape(country['name'])})</b>:",
@@ -1268,7 +1311,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "2\ufe0f\u20e3 <b>\u0623\u0648 \u0625\u0631\u0633\u0627\u0644 \u0635\u0648\u0631\u0629 QR Code:</b> \u0623\u0631\u0633\u0644 \u0635\u0648\u0631\u0629 \u0643\u0648\u062f \u0627\u0644\u0640 QR \u0645\u0628\u0627\u0634\u0631\u0629 (\u0648\u064a\u0645\u0643\u0646\u0643 \u0643\u062a\u0627\u0628\u0629 \u0643\u0648\u062f \u0627\u0644\u0640 LPA \u0623\u0648 \u0645\u0644\u0627\u062d\u0638\u0627\u062a \u0641\u064a \u0648\u0635\u0641 \u0627\u0644\u0635\u0648\u0631\u0629 Caption).\n\n"
                 "\U0001f514 <i>\u0645\u0644\u0627\u062d\u0638\u0629: \u0628\u0645\u062c\u0631\u062f \u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u0634\u0631\u064a\u062d\u0629\u060c \u0633\u064a\u0642\u0648\u0645 \u0627\u0644\u0628\u0648\u062a \u062a\u0644\u0642\u0627\u0626\u064a\u0627\u064b \u0628\u0625\u0631\u0633\u0627\u0644 \u0625\u0634\u0639\u0627\u0631 \u0639\u0627\u0645 \u0644\u062c\u0645\u064a\u0639 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u064a\u0646 \u0628\u062a\u0648\u0641\u0631 \u0645\u062e\u0632\u0648\u0646 \u062c\u062f\u064a\u062f!</i>"
             )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0625\u0644\u063a\u0627\u0621 \u0648\u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_view:{plan_id}")]])
+            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621 \u0648\u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_view:{plan_id}")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1287,8 +1330,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     "\u26a0\ufe0f \u0644\u0627 \u062a\u0648\u062c\u062f \u0634\u0631\u0627\u0626\u062d \u0645\u062a\u0627\u062d\u0629 \u062d\u0627\u0644\u064a\u0627\u064b \u0641\u064a \u0645\u062e\u0632\u0648\u0646 \u0647\u0630\u0647 \u0627\u0644\u0628\u0627\u0642\u0629."
                 )
                 kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0634\u0631\u064a\u062d\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data=f"adm_esim_add:{plan_id}")],
-                    [InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_view:{plan_id}")],
+                    [IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0634\u0631\u064a\u062d\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data=f"adm_esim_add:{plan_id}")],
+                    [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_view:{plan_id}")],
                 ])
                 await safe_edit_or_send(update, text, kb)
                 return
@@ -1298,13 +1341,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 t_badge = "\U0001f511 LPA" if e["item_type"] == "lpa" else "\U0001f5bc QR"
                 short_code = (e["lpa_code"][:22] + "...") if e["lpa_code"] and len(e["lpa_code"]) > 22 else (e["lpa_code"] or "\u0635\u0648\u0631\u0629 QR")
                 rows.append([
-                    InlineKeyboardButton(
+                    IKB(
                         f"#{e['id']} | {t_badge} | {short_code}",
                         callback_data=f"adm_esim_item:{e['id']}",
                     )
                 ])
-            rows.append([InlineKeyboardButton("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0634\u0631\u064a\u062d\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data=f"adm_esim_add:{plan_id}")])
-            rows.append([InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_view:{plan_id}")])
+            rows.append([IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0634\u0631\u064a\u062d\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data=f"adm_esim_add:{plan_id}")])
+            rows.append([IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_view:{plan_id}")])
             text = (
                 f"\U0001f4cb <b>\u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0627\u0644\u0645\u062a\u0627\u062d\u0629 \u0641\u064a \u0645\u062e\u0632\u0648\u0646: {html.escape(plan['name'])}</b>\n"
                 f"\u0625\u062c\u0645\u0627\u0644\u064a \u0627\u0644\u0645\u062a\u0627\u062d: <b>{len(esims)}</b> \u0634\u0631\u064a\u062d\u0629.\n"
@@ -1334,10 +1377,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 f"\U0001f4c5 <b>\u062a\u0627\u0631\u064a\u062e \u0627\u0644\u0625\u0636\u0627\u0641\u0629:</b> {esim['created_at']}"
             )
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("\U0001f441 \u0645\u0639\u0627\u064a\u0646\u0629 \u0643\u0648\u062f \u0627\u0644\u0640 QR \u0643\u0645\u0627 \u064a\u0638\u0647\u0631 \u0644\u0644\u0639\u0645\u064a\u0644", callback_data=f"adm_esim_preview:{esim['id']}")],
-                [InlineKeyboardButton("\u270f\ufe0f \u062a\u0639\u062f\u064a\u0644 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 (LPA \u0623\u0648 QR)", callback_data=f"adm_esim_edit:{esim['id']}")],
-                [InlineKeyboardButton("\U0001f5d1\ufe0f \u062d\u0630\u0641 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0645\u0646 \u0627\u0644\u0645\u062e\u0632\u0648\u0646", callback_data=f"adm_esim_del:{esim['id']}")],
-                [InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0634\u0631\u0627\u0626\u062d", callback_data=f"adm_esim_list:{esim['plan_id']}")],
+                [IKB("\U0001f441 \u0645\u0639\u0627\u064a\u0646\u0629 \u0643\u0648\u062f \u0627\u0644\u0640 QR \u0643\u0645\u0627 \u064a\u0638\u0647\u0631 \u0644\u0644\u0639\u0645\u064a\u0644", callback_data=f"adm_esim_preview:{esim['id']}")],
+                [IKB("\u270f\ufe0f \u062a\u0639\u062f\u064a\u0644 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 (LPA \u0623\u0648 QR)", callback_data=f"adm_esim_edit:{esim['id']}")],
+                [IKB("\U0001f5d1\ufe0f \u062d\u0630\u0641 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0645\u0646 \u0627\u0644\u0645\u062e\u0632\u0648\u0646", callback_data=f"adm_esim_del:{esim['id']}")],
+                [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0634\u0631\u0627\u0626\u062d", callback_data=f"adm_esim_list:{esim['plan_id']}")],
             ])
             await safe_edit_or_send(update, text, kb)
             return
@@ -1370,7 +1413,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                 "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0643\u0648\u062f \u0627\u0644\u0640 LPA \u0627\u0644\u062c\u062f\u064a\u062f</b> \u0643\u0646\u0635\u060c \u0623\u0648 \u0623\u0631\u0633\u0644 <b>\u0635\u0648\u0631\u0629 QR Code \u062c\u062f\u064a\u062f\u0629</b> \u0644\u062a\u062d\u062f\u064a\u062b \u0647\u0630\u0647 \u0627\u0644\u0634\u0631\u064a\u062d\u0629:"
             )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data=f"adm_esim_item:{esim_id}")]])
+            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data=f"adm_esim_item:{esim_id}")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1384,7 +1427,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await safe_edit_or_send(
                     update,
                     "\u2705 <b>\u062a\u0645 \u062d\u0630\u0641 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0645\u0646 \u0627\u0644\u0645\u062e\u0632\u0648\u0646 \u0628\u0646\u062c\u0627\u062d.</b>",
-                    InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0634\u0631\u0627\u0626\u062d", callback_data=f"adm_esim_list:{plan_id}")]]),
+                    InlineKeyboardMarkup([[IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0634\u0631\u0627\u0626\u062d", callback_data=f"adm_esim_list:{plan_id}")]]),
                 )
             return
 
@@ -1396,12 +1439,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             rows = []
             for req in pending[:20]:
                 rows.append([
-                    InlineKeyboardButton(
+                    IKB(
                         f"\u23f3 \u0637\u0644\u0628 #{req['id']} | {req['full_name'] or req['user_id']} | {req['country_name']} - {req['plan_name']} ({float(req['refund_amount'] or 0):.2f} {currency})",
                         callback_data=f"adm_refund_view:{req['id']}",
                     )
                 ])
-            rows.append([InlineKeyboardButton("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
+            rows.append([IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
             text = (
                 "\u21a9\ufe0f <b>\u0637\u0644\u0628\u0627\u062a \u0627\u0644\u0627\u0633\u062a\u0631\u062f\u0627\u062f \u0627\u0644\u0645\u0639\u0644\u0642\u0629</b>\n"
                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -1418,8 +1461,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if not req:
                 return
             adm_kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("\u2705 \u062a\u0645\u062a \u0627\u0644\u0645\u0631\u0627\u062c\u0639\u0629 (\u0628\u062f\u0648\u0646 \u062a\u0639\u062f\u064a\u0644 \u0631\u0635\u064a\u062f)", callback_data=f"adm_refund_done:{req['id']}")],
-                [InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0637\u0644\u0628\u0627\u062a", callback_data="adm_refunds_menu")],
+                [IKB("\u2705 \u062a\u0645\u062a \u0627\u0644\u0645\u0631\u0627\u062c\u0639\u0629 (\u0628\u062f\u0648\u0646 \u062a\u0639\u062f\u064a\u0644 \u0631\u0635\u064a\u062f)", callback_data=f"adm_refund_done:{req['id']}")],
+                [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0637\u0644\u0628\u0627\u062a", callback_data="adm_refunds_menu")],
             ])
             await send_refund_video_to_admin(context, req, markup=adm_kb)
             return
@@ -1443,7 +1486,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     chat_id=res["user_id"],
                     text=user_msg,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
+                    reply_markup=InlineKeyboardMarkup([[IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
                 )
             except TelegramError:
                 pass
@@ -1458,17 +1501,17 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             clear_state(context)
             pending = db.get_pending_topups()
             rows = [
-                [InlineKeyboardButton("\u2795 \u0625\u0636\u0627\u0641\u0629 / \u062e\u0635\u0645 \u0631\u0635\u064a\u062f \u0644\u0645\u0633\u062a\u062e\u062f\u0645 \u064a\u062f\u0648\u064a\u0627\u064b", callback_data="adm_bal_manual")],
+                [IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 / \u062e\u0635\u0645 \u0631\u0635\u064a\u062f \u0644\u0645\u0633\u062a\u062e\u062f\u0645 \u064a\u062f\u0648\u064a\u0627\u064b", callback_data="adm_bal_manual")],
             ]
             for req in pending[:20]:
                 m_icon = "\U0001f7e1 Binance" if req["method"] == "binance" else "\U0001f7e3 InstaPay"
                 rows.append([
-                    InlineKeyboardButton(
+                    IKB(
                         f"\u23f3 \u0637\u0644\u0628 #{req['id']} | {m_icon} | {float(req['amount']):.2f} {currency}",
                         callback_data=f"adm_topup_view:{req['id']}",
                     )
                 ])
-            rows.append([InlineKeyboardButton("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
+            rows.append([IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
             text = (
                 "\U0001f4b3 <b>\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0623\u0631\u0635\u062f\u0629 \u0648\u0637\u0644\u0628\u0627\u062a \u0627\u0644\u0634\u062d\u0646</b>\n"
                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -1497,10 +1540,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             kb = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("\u2705 \u0642\u0628\u0648\u0644 \u0648\u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u0631\u0635\u064a\u062f", callback_data=f"adm_topup_ok:{req['id']}"),
-                    InlineKeyboardButton("\u274c \u0631\u0641\u0636 \u0627\u0644\u0637\u0644\u0628", callback_data=f"adm_topup_no:{req['id']}"),
+                    IKB("\u2705 \u0642\u0628\u0648\u0644 \u0648\u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u0631\u0635\u064a\u062f", callback_data=f"adm_topup_ok:{req['id']}"),
+                    IKB("\u274c \u0631\u0641\u0636 \u0627\u0644\u0637\u0644\u0628", callback_data=f"adm_topup_no:{req['id']}"),
                 ],
-                [InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0637\u0644\u0628\u0627\u062a", callback_data="adm_topups_menu")],
+                [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0637\u0644\u0628\u0627\u062a", callback_data="adm_topups_menu")],
             ])
             if req.get("proof_file_id"):
                 try:
@@ -1547,7 +1590,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     chat_id=res["user_id"],
                     text=user_msg,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
+                    reply_markup=InlineKeyboardMarkup([[IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
                 )
             except TelegramError:
                 pass
@@ -1563,7 +1606,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                 "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0645\u0639\u0631\u0641 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 (User ID)</b> \u0627\u0644\u0630\u064a \u062a\u0631\u064a\u062f \u062a\u0639\u062f\u064a\u0644 \u0631\u0635\u064a\u062f\u0647:"
             )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_topups_menu")]])
+            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_topups_menu")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1574,17 +1617,17 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             stats = db.get_stats()
             banned_list = db.get_banned_users()
             rows = [
-                [InlineKeyboardButton("\U0001f6ab \u062d\u0638\u0631 \u0645\u0633\u062a\u062e\u062f\u0645 \u0628\u0648\u0627\u0633\u0637\u0629 \u0627\u0644\u0640 ID", callback_data="adm_ban_input")],
-                [InlineKeyboardButton("\u2705 \u0641\u0643 \u062d\u0638\u0631 \u0645\u0633\u062a\u062e\u062f\u0645 \u0628\u0648\u0627\u0633\u0637\u0629 \u0627\u0644\u0640 ID", callback_data="adm_unban_input")],
+                [IKB("\U0001f6ab \u062d\u0638\u0631 \u0645\u0633\u062a\u062e\u062f\u0645 \u0628\u0648\u0627\u0633\u0637\u0629 \u0627\u0644\u0640 ID", callback_data="adm_ban_input")],
+                [IKB("\u2705 \u0641\u0643 \u062d\u0638\u0631 \u0645\u0633\u062a\u062e\u062f\u0645 \u0628\u0648\u0627\u0633\u0637\u0629 \u0627\u0644\u0640 ID", callback_data="adm_unban_input")],
             ]
             for b in banned_list[:15]:
                 rows.append([
-                    InlineKeyboardButton(
+                    IKB(
                         f"\U0001f513 \u0641\u0643 \u062d\u0638\u0631: {b['full_name'] or b['user_id']} ({b['user_id']})",
                         callback_data=f"adm_unban_direct:{b['user_id']}",
                     )
                 ])
-            rows.append([InlineKeyboardButton("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
+            rows.append([IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
             text = (
                 "\U0001f465 <b>\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u064a\u0646 \u0648\u0627\u0644\u062d\u0638\u0631</b>\n"
                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -1603,7 +1646,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                 "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0645\u0639\u0631\u0641 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 (User ID)</b> \u0627\u0644\u0630\u064a \u062a\u0631\u064a\u062f \u062d\u0638\u0631\u0647 \u0646\u0647\u0627\u0626\u064a\u0627\u064b \u0645\u0646 \u0627\u0633\u062a\u062e\u062f\u0627\u0645 \u0627\u0644\u0628\u0648\u062a:"
             )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_users_menu")]])
+            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_users_menu")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1615,7 +1658,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                 "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0645\u0639\u0631\u0641 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 (User ID)</b> \u0644\u0625\u0644\u063a\u0627\u0621 \u062d\u0638\u0631\u0647:"
             )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_users_menu")]])
+            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_users_menu")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1643,7 +1686,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                 "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0627\u0644\u0631\u0633\u0627\u0644\u0629 \u0627\u0644\u0646\u0635\u064a\u0629</b> \u0623\u0648 <b>\u0627\u0644\u0635\u0648\u0631\u0629 \u0645\u0639 \u0627\u0644\u0648\u0635\u0641</b> \u0627\u0644\u062a\u064a \u062a\u0631\u064a\u062f \u0625\u0631\u0633\u0627\u0644\u0647\u0627 \u0644\u062c\u0645\u064a\u0639 \u0645\u0633\u062a\u062e\u062f\u0645\u064a \u0627\u0644\u0628\u0648\u062a:"
             )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_home")]])
+            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_home")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1666,11 +1709,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "\U0001f447 \u0627\u0636\u063a\u0637 \u0639\u0644\u0649 \u0623\u064a \u0625\u0639\u062f\u0627\u062f \u0644\u062a\u0639\u062f\u064a\u0644\u0647 \u0645\u0628\u0627\u0634\u0631\u0629:"
             )
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("\U0001f7e1 \u062a\u0639\u062f\u064a\u0644 \u0645\u0639\u0631\u0641 Binance ID", callback_data="adm_set_key:binance_id")],
-                [InlineKeyboardButton("\U0001f7e3 \u062a\u0639\u062f\u064a\u0644 \u0639\u0646\u0648\u0627\u0646 InstaPay EG", callback_data="adm_set_key:instapay_address")],
-                [InlineKeyboardButton("\U0001f6df \u062a\u0639\u062f\u064a\u0644 \u064a\u0648\u0632\u0631 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a", callback_data="adm_set_key:support_username")],
-                [InlineKeyboardButton("\U0001f4b5 \u062a\u0639\u062f\u064a\u0644 \u0631\u0645\u0632 \u0627\u0644\u0639\u0645\u0644\u0629 (USD / EGP)", callback_data="adm_set_key:currency")],
-                [InlineKeyboardButton("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")],
+                [IKB("\U0001f7e1 \u062a\u0639\u062f\u064a\u0644 \u0645\u0639\u0631\u0641 Binance ID", callback_data="adm_set_key:binance_id")],
+                [IKB("\U0001f7e3 \u062a\u0639\u062f\u064a\u0644 \u0639\u0646\u0648\u0627\u0646 InstaPay EG", callback_data="adm_set_key:instapay_address")],
+                [IKB("\U0001f6df \u062a\u0639\u062f\u064a\u0644 \u064a\u0648\u0632\u0631 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a", callback_data="adm_set_key:support_username")],
+                [IKB("\U0001f4b5 \u062a\u0639\u062f\u064a\u0644 \u0631\u0645\u0632 \u0627\u0644\u0639\u0645\u0644\u0629 (USD / EGP)", callback_data="adm_set_key:currency")],
+                [IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")],
             ])
             await safe_edit_or_send(update, text, kb)
             return
@@ -1691,7 +1734,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                 "\u0623\u0631\u0633\u0644 \u0627\u0644\u0642\u064a\u0645\u0629 \u0627\u0644\u062c\u062f\u064a\u062f\u0629 \u0627\u0644\u0622\u0646:"
             )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_settings")]])
+            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_settings")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1753,7 +1796,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "\U0001f4f8 <b>\u0627\u0644\u062e\u0637\u0648\u0629 \u0627\u0644\u0623\u062e\u064a\u0631\u0629:</b>\n"
             "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0635\u0648\u0631\u0629 \u0625\u064a\u0635\u0627\u0644 \u0627\u0644\u062a\u062d\u0648\u064a\u0644 (Screenshot)</b> \u0623\u0648 \u0623\u0631\u0633\u0644 <b>\u0631\u0642\u0645 \u0627\u0644\u0639\u0645\u0644\u064a\u0629 \u0627\u0644\u0645\u0631\u062c\u0639\u064a (Transaction ID / \u0627\u0633\u0645 \u0627\u0644\u0645\u062d\u0648\u0644)</b> \u0641\u064a \u0631\u0633\u0627\u0644\u0629:",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f3e0 \u0625\u0644\u063a\u0627\u0621", callback_data="home")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f3e0 \u0625\u0644\u063a\u0627\u0621", callback_data="home")]]),
         )
         return
 
@@ -1786,7 +1829,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"\U0001f4b5 <b>\u0627\u0644\u0645\u0628\u0644\u063a:</b> {amount:.2f} {html.escape(currency)}\n"
             "\u23f3 \u062c\u0627\u0631\u064a \u0645\u0631\u0627\u062c\u0639\u0629 \u0627\u0644\u062a\u062d\u0648\u064a\u0644 \u0645\u0646 \u0642\u0650\u0628\u0644 \u0627\u0644\u0625\u062f\u0627\u0631\u0629\u060c \u0648\u0633\u064a\u0635\u0644 \u0625\u0644\u064a\u0643 \u0625\u0634\u0639\u0627\u0631 \u0641\u0648\u0631 \u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u0631\u0635\u064a\u062f \u0644\u062d\u0633\u0627\u0628\u0643.",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
         )
 
         # Notify Admin immediately
@@ -1803,8 +1846,8 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             adm_kb = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("\u2705 \u0642\u0628\u0648\u0644 \u0648\u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u0631\u0635\u064a\u062f", callback_data=f"adm_topup_ok:{req_id}"),
-                    InlineKeyboardButton("\u274c \u0631\u0641\u0636 \u0627\u0644\u0637\u0644\u0628", callback_data=f"adm_topup_no:{req_id}"),
+                    IKB("\u2705 \u0642\u0628\u0648\u0644 \u0648\u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u0631\u0635\u064a\u062f", callback_data=f"adm_topup_ok:{req_id}"),
+                    IKB("\u274c \u0631\u0641\u0636 \u0627\u0644\u0637\u0644\u0628", callback_data=f"adm_topup_no:{req_id}"),
                 ]
             ])
             try:
@@ -1844,7 +1887,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "(\u0645\u062b\u0644: \u062a\u0633\u062c\u064a\u0644 \u0634\u0627\u0634\u0629 \u064a\u0638\u0647\u0631 \u0641\u064a\u0647 \u0643\u0648\u062f \u0627\u0644\u0640 QR \u0648\u0631\u0633\u0627\u0644\u0629 \u0627\u0644\u062e\u0637\u0623 \u0639\u0646\u062f \u0627\u0644\u062a\u0641\u0639\u064a\u0644).\n"
             "\u26a0\ufe0f <b>\u0644\u0646 \u064a\u062a\u0645 \u0642\u0628\u0648\u0644 \u0627\u0644\u0637\u0644\u0628 \u0628\u062f\u0648\u0646 \u0641\u064a\u062f\u064a\u0648.</b>",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f3e0 \u0625\u0644\u063a\u0627\u0621 \u0648\u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f3e0 \u0625\u0644\u063a\u0627\u0621 \u0648\u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
         )
         return
 
@@ -1890,7 +1933,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await msg.reply_text(
                 "\u26a0\ufe0f <b>\u064a\u0648\u062c\u062f \u0628\u0627\u0644\u0641\u0639\u0644 \u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f \u0644\u0647\u0630\u0647 \u0627\u0644\u0634\u0631\u064a\u062d\u0629.</b>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
+                reply_markup=InlineKeyboardMarkup([[IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
             )
             return
 
@@ -1902,14 +1945,14 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "\U0001f3ac <b>\u062a\u0645 \u0625\u0631\u0633\u0627\u0644 \u0641\u064a\u062f\u064a\u0648 \u0627\u0644\u0625\u062b\u0628\u0627\u062a \u0625\u0644\u0649 \u0627\u0644\u0625\u062f\u0627\u0631\u0629.</b>\n"
             "\u23f3 \u0637\u0644\u0628\u0643 \u0642\u064a\u062f \u0627\u0644\u0645\u0631\u0627\u062c\u0639\u0629 \u0644\u062f\u0649 \u0627\u0644\u0625\u062f\u0627\u0631\u0629\u060c \u0648\u0633\u064a\u062a\u0645 \u0625\u0634\u0639\u0627\u0631\u0643 \u0641\u0648\u0631 \u0627\u0643\u062a\u0645\u0627\u0644 \u0627\u0644\u0645\u0631\u0627\u062c\u0639\u0629.",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="home")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("🏠 القائمة الرئيسية", callback_data="home")]]),
         )
 
         # Forward the video proof and request details to the owner
         req = db.get_refund_request(req_id)
         if req:
             adm_kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ تمت المراجعة (بدون تعديل رصيد)", callback_data=f"adm_refund_done:{req_id}"),
+                IKB("✅ تمت المراجعة (بدون تعديل رصيد)", callback_data=f"adm_refund_done:{req_id}"),
             ]])
             await send_refund_video_to_admin(context, req, markup=adm_kb)
         return
@@ -1931,15 +1974,15 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not cid:
             await msg.reply_text(
                 "\u26a0\ufe0f \u0647\u0630\u0647 \u0627\u0644\u062f\u0648\u0644\u0629 \u0645\u0648\u062c\u0648\u062f\u0629 \u0628\u0627\u0644\u0641\u0639\u0644!",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u062f\u0648\u0644", callback_data="adm_countries")]]),
+                reply_markup=InlineKeyboardMarkup([[IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u062f\u0648\u0644", callback_data="adm_countries")]]),
             )
             return
         await msg.reply_text(
             f"\u2705 <b>\u062a\u0645\u062a \u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u062f\u0648\u0644\u0629 ({html.escape(msg.text.strip())}) \u0628\u0646\u062c\u0627\u062d!</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0628\u0627\u0642\u0629 \u0644\u0647\u0630\u0647 \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plan_add:{cid}")],
-                [InlineKeyboardButton("\U0001f30d \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062f\u0648\u0644", callback_data="adm_countries")],
+                [IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0628\u0627\u0642\u0629 \u0644\u0647\u0630\u0647 \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plan_add:{cid}")],
+                [IKB("\U0001f30d \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062f\u0648\u0644", callback_data="adm_countries")],
             ]),
         )
         return
@@ -1953,7 +1996,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await msg.reply_text(
             "\u2705 <b>\u062a\u0645 \u062a\u062d\u062f\u064a\u062b \u0627\u0633\u0645 \u0627\u0644\u062f\u0648\u0644\u0629 \u0628\u0646\u062c\u0627\u062d!</b>" if ok else "\u26a0\ufe0f \u062a\u0639\u0630\u0631 \u062a\u062d\u062f\u064a\u062b \u0627\u0644\u0627\u0633\u0645.",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_country_view:{country_id}")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_country_view:{country_id}")]]),
         )
         return
 
@@ -2001,8 +2044,8 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"\u2705 <b>\u062a\u0645\u062a \u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u0628\u0627\u0642\u0629 ({html.escape(temp['name'])}) \u0628\u0633\u0639\u0631 {price:.2f} {html.escape(currency)} \u0628\u0646\u062c\u0627\u062d!</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0634\u0631\u0627\u0626\u062d eSIM \u0644\u0647\u0630\u0647 \u0627\u0644\u0628\u0627\u0642\u0629 \u0627\u0644\u0622\u0646", callback_data=f"adm_esim_add:{plan_id}")],
-                [InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0628\u0627\u0642\u0627\u062a \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plans_country:{country_id}")],
+                [IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0634\u0631\u0627\u0626\u062d eSIM \u0644\u0647\u0630\u0647 \u0627\u0644\u0628\u0627\u0642\u0629 \u0627\u0644\u0622\u0646", callback_data=f"adm_esim_add:{plan_id}")],
+                [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0628\u0627\u0642\u0627\u062a \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plans_country:{country_id}")],
             ]),
         )
         return
@@ -2064,7 +2107,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await msg.reply_text(
             "\u2705 <b>\u062a\u0645 \u062a\u062d\u062f\u064a\u062b \u0628\u064a\u0627\u0646\u0627\u062a \u0627\u0644\u0628\u0627\u0642\u0629 \u0628\u0646\u062c\u0627\u062d!</b>",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_view:{plan_id}")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_view:{plan_id}")]]),
         )
         return
 
@@ -2125,9 +2168,9 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"\U0001f4e2 <b>\u062a\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0625\u0634\u0639\u0627\u0631 \u0627\u0644\u0639\u0627\u0645 \u0628\u0646\u062c\u0627\u062d \u0625\u0644\u0649:</b> {sent} \u0645\u0633\u062a\u062e\u062f\u0645 (\u0641\u0634\u0644/\u0645\u062d\u0638\u0648\u0631: {failed}).",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0634\u0631\u0627\u0626\u062d \u0623\u062e\u0631\u0649 \u0644\u0646\u0641\u0633 \u0627\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_esim_add:{plan_id}")],
-                [InlineKeyboardButton("\U0001f4cb \u0639\u0631\u0636 \u0645\u062e\u0632\u0648\u0646 \u0627\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_esim_list:{plan_id}")],
-                [InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_view:{plan_id}")],
+                [IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0634\u0631\u0627\u0626\u062d \u0623\u062e\u0631\u0649 \u0644\u0646\u0641\u0633 \u0627\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_esim_add:{plan_id}")],
+                [IKB("\U0001f4cb \u0639\u0631\u0636 \u0645\u062e\u0632\u0648\u0646 \u0627\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_esim_list:{plan_id}")],
+                [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_view:{plan_id}")],
             ]),
         )
         return
@@ -2174,8 +2217,8 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"\u2705 <b>\u062a\u0645 \u062a\u062d\u062f\u064a\u062b \u0628\u064a\u0627\u0646\u0627\u062a \u0627\u0644\u0634\u0631\u064a\u062d\u0629 #{esim_id} \u0628\u0646\u062c\u0627\u062d!</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("\U0001f50e \u0639\u0631\u0636 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0628\u0639\u062f \u0627\u0644\u062a\u0639\u062f\u064a\u0644", callback_data=f"adm_esim_item:{esim_id}")],
-                [InlineKeyboardButton("\U0001f4cb \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0634\u0631\u0627\u0626\u062d", callback_data=f"adm_esim_list:{plan_id}")],
+                [IKB("\U0001f50e \u0639\u0631\u0636 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0628\u0639\u062f \u0627\u0644\u062a\u0639\u062f\u064a\u0644", callback_data=f"adm_esim_item:{esim_id}")],
+                [IKB("\U0001f4cb \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0634\u0631\u0627\u0626\u062d", callback_data=f"adm_esim_list:{plan_id}")],
             ]),
         )
         return
@@ -2220,7 +2263,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"\u2705 <b>\u062a\u0645 \u062a\u062d\u062f\u064a\u062b \u0631\u0635\u064a\u062f \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 <code>{target_id}</code> \u0628\u0646\u062c\u0627\u062d!</b>\n"
             f"\U0001f4b0 <b>\u0627\u0644\u0631\u0635\u064a\u062f \u0627\u0644\u062c\u062f\u064a\u062f:</b> <code>{float(new_bal or 0):.2f}</code> {html.escape(currency)}",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0623\u0631\u0635\u062f\u0629", callback_data="adm_topups_menu")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0623\u0631\u0635\u062f\u0629", callback_data="adm_topups_menu")]]),
         )
         try:
             action_word = f"\u0625\u0636\u0627\u0641\u0629 {delta:.2f}" if delta >= 0 else f"\u062e\u0635\u0645 {abs(delta):.2f}"
@@ -2255,7 +2298,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await msg.reply_text(
             f"<b>{status_str} (<code>{target_id}</code>) \u0628\u0646\u062c\u0627\u062d!</b>",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u064a\u0646", callback_data="adm_users_menu")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u064a\u0646", callback_data="adm_users_menu")]]),
         )
         return
 
@@ -2285,7 +2328,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"\U0001f4e8 <b>\u062a\u0645 \u0627\u0644\u0625\u0631\u0633\u0627\u0644 \u0628\u0646\u062c\u0627\u062d \u0625\u0644\u0649:</b> {sent} \u0645\u0633\u062a\u062e\u062f\u0645\n"
             f"\u26a0\ufe0f <b>\u0641\u0634\u0644 / \u0642\u0627\u0645\u0648\u0627 \u0628\u062d\u0638\u0631 \u0627\u0644\u0628\u0648\u062a:</b> {failed} \u0645\u0633\u062a\u062e\u062f\u0645",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")]]),
         )
         return
 
@@ -2304,7 +2347,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await msg.reply_text(
             f"\u2705 <b>\u062a\u0645 \u062a\u062d\u062f\u064a\u062b \u0627\u0644\u0625\u0639\u062f\u0627\u062f \u0628\u0646\u062c\u0627\u062d \u0625\u0644\u0649:</b> <code>{html.escape(val)}</code>",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0625\u0639\u062f\u0627\u062f\u0627\u062a", callback_data="adm_settings")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0625\u0639\u062f\u0627\u062f\u0627\u062a", callback_data="adm_settings")]]),
         )
         return
 
