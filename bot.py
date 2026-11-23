@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 import asyncio
+import csv
 import html
 import io
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 
 import qrcode
 from telegram import (
@@ -17,7 +19,7 @@ from telegram import (
     InputFile,
 )
 from telegram.constants import ParseMode
-from telegram.error import TelegramError, BadRequest, Forbidden
+from telegram.error import TelegramError, BadRequest, Forbidden, RetryAfter
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -37,12 +39,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEFAULT_CUSTOMER = "\u0639\u0632\u064a\u0632\u064a \u0627\u0644\u0639\u0645\u064a\u0644"
-NO_DESC = "\u0628\u062f\u0648\u0646 \u0648\u0635\u0641"
-NO_LPA_QR = "\u0644\u0627 \u064a\u0648\u062c\u062f (\u0635\u0648\u0631\u0629 QR)"
-NONE_STR = "\u0644\u0627 \u064a\u0648\u062c\u062f"
-NO_USER = "\u0628\u062f\u0648\u0646"
-ATTACHED_RECEIPT = "\u0645\u0631\u0641\u0642 \u0635\u0648\u0631\u0629 \u0625\u064a\u0635\u0627\u0644"
+DEFAULT_CUSTOMER = "عزيزي العميل"
+NO_DESC = "بدون وصف"
+NO_LPA_QR = "لا يوجد (صورة QR)"
+NONE_STR = "لا يوجد"
+NO_USER = "بدون"
+ATTACHED_RECEIPT = "مرفق صورة إيصال"
 
 
 
@@ -73,9 +75,32 @@ def generate_qr_bytes(data: str) -> io.BytesIO:
     return bio
 
 
+def generate_qr_bytes_async(data: str):
+    return asyncio.to_thread(generate_qr_bytes, data)
+
+
+def _read_binary_file(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def clear_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("state", None)
     context.user_data.pop("temp", None)
+
+
+def ensure_user_synced(user, context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
+    """Avoid repeat write transactions for an unchanged user profile."""
+    sig = ((user.username or "").strip().lstrip("@"), (user.full_name or "").strip())
+    user_data = getattr(context, "user_data", None)
+    if isinstance(user_data, dict) and user_data.get("_user_sig") == sig:
+        existing = db.get_user(user.id)
+        if existing is not None:
+            return existing
+    row = db.upsert_user(user.id, user.username, user.full_name)
+    if isinstance(user_data, dict):
+        user_data["_user_sig"] = sig
+    return row
 
 
 async def check_ban_guard(update: Update) -> bool:
@@ -88,11 +113,11 @@ async def check_ban_guard(update: Update) -> bool:
     if db.is_user_banned(user.id):
         support = db.get_setting("support_username", "Support").lstrip("@")
         msg = (
-            "\u26d4 <b>\u0639\u0630\u0631\u0627\u064b\u060c \u062a\u0645 \u062d\u0638\u0631 \u062d\u0633\u0627\u0628\u0643 \u0645\u0646 \u0627\u0633\u062a\u062e\u062f\u0627\u0645 \u0647\u0630\u0627 \u0627\u0644\u0628\u0648\u062a.</b>\n\n"
-            f"\u0644\u0644\u062a\u0648\u0627\u0635\u0644 \u0645\u0639 \u0627\u0644\u0625\u062f\u0627\u0631\u0629 \u0648\u0627\u0644\u0627\u0633\u062a\u0641\u0633\u0627\u0631: @{html.escape(support)}"
+            "⛔ <b>عذراً، تم حظر حسابك من استخدام هذا البوت.</b>\n\n"
+            f"للتواصل مع الإدارة والاستفسار: @{html.escape(support)}"
         )
         if update.callback_query:
-            await update.callback_query.answer("\u26d4 \u062d\u0633\u0627\u0628\u0643 \u0645\u062d\u0638\u0648\u0631 \u0645\u0646 \u0627\u0633\u062a\u062e\u062f\u0627\u0645 \u0627\u0644\u0628\u0648\u062a.", show_alert=True)
+            await update.callback_query.answer("⛔ حسابك محظور من استخدام البوت.", show_alert=True)
         elif update.message:
             await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
         return True
@@ -141,7 +166,7 @@ async def deliver_esim_to_chat(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
     esim: Dict[str, Any],
-    header_title: str = "\U0001f389 <b>\u062a\u0645 \u0634\u0631\u0627\u0621 \u0634\u0631\u064a\u062d\u0629 eSIM \u0628\u0646\u062c\u0627\u062d!</b>",
+    header_title: str = "🎉 <b>تم شراء شريحة eSIM بنجاح!</b>",
 ) -> None:
     currency = get_currency()
     country_name = html.escape(str(esim.get("country_name", "")))
@@ -153,33 +178,33 @@ async def deliver_esim_to_chat(
 
     caption_lines = [
         header_title,
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
-        f"\U0001f30d <b>\u0627\u0644\u062f\u0648\u0644\u0629:</b> {country_name}",
-        f"\U0001f4e6 <b>\u0627\u0644\u0628\u0627\u0642\u0629:</b> {plan_name}",
-        f"\U0001f4b5 <b>\u0627\u0644\u0633\u0639\u0631:</b> {paid_price:.2f} {html.escape(currency)}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🌍 <b>الدولة:</b> {country_name}",
+        f"📦 <b>الباقة:</b> {plan_name}",
+        f"💵 <b>السعر:</b> {paid_price:.2f} {html.escape(currency)}",
     ]
     if new_balance is not None:
-        caption_lines.append(f"\U0001f4b0 <b>\u0631\u0635\u064a\u062f\u0643 \u0627\u0644\u0645\u062a\u0628\u0642\u064a:</b> {float(new_balance):.2f} {html.escape(currency)}")
+        caption_lines.append(f"💰 <b>رصيدك المتبقي:</b> {float(new_balance):.2f} {html.escape(currency)}")
     if lpa_code:
         caption_lines.extend([
             "",
-            "\U0001f511 <b>\u0643\u0648\u062f \u0627\u0644\u062a\u0641\u0639\u064a\u0644 \u0627\u0644\u0645\u0628\u0627\u0634\u0631 (LPA):</b>",
+            "🔑 <b>كود التفعيل المباشر (LPA):</b>",
             f"<code>{html.escape(lpa_code)}</code>",
         ])
     if notes:
         caption_lines.extend([
             "",
-            f"\U0001f4dd <b>\u0645\u0644\u0627\u062d\u0638\u0627\u062a \u0625\u0636\u0627\u0641\u064a\u0629:</b>\n{html.escape(notes)}",
+            f"📝 <b>ملاحظات إضافية:</b>\n{html.escape(notes)}",
         ])
     caption_lines.extend([
         "",
-        "\U0001f4f2 <b>\u0637\u0631\u064a\u0642\u0629 \u0627\u0644\u062a\u0641\u0639\u064a\u0644:</b>",
-        "1\ufe0f\u20e3 \u0627\u0641\u062a\u062d \u0627\u0644\u0625\u0639\u062f\u0627\u062f\u0627\u062a \u0641\u064a \u0647\u0627\u062a\u0641\u0643 \u062b\u0645 (\u0628\u064a\u0627\u0646\u0627\u062a \u0627\u0644\u0647\u0627\u062a\u0641 / \u0627\u0644\u062e\u0644\u0648\u064a\u0629).",
-        "2\ufe0f\u20e3 \u0627\u062e\u062a\u0631 <b>\u0625\u0636\u0627\u0641\u0629 \u0634\u0631\u064a\u062d\u0629 \u0625\u0644\u0643\u062a\u0631\u0648\u0646\u064a\u0629 (Add eSIM)</b>.",
-        "3\ufe0f\u20e3 \u0627\u0645\u0633\u062d \u0643\u0648\u062f \u0627\u0644\u0640 QR \u0627\u0644\u0645\u0631\u0641\u0642 \u0623\u0648 \u0627\u0646\u0633\u062e \u0643\u0648\u062f \u0627\u0644\u0640 LPA \u0623\u0639\u0644\u0627\u0647 \u0648\u0623\u062f\u062e\u0644\u0647 \u064a\u062f\u0648\u064a\u0627\u064b.",
+        "📲 <b>طريقة التفعيل:</b>",
+        "1️⃣ افتح الإعدادات في هاتفك ثم (بيانات الهاتف / الخلوية).",
+        "2️⃣ اختر <b>إضافة شريحة إلكترونية (Add eSIM)</b>.",
+        "3️⃣ امسح كود الـ QR المرفق أو انسخ كود الـ LPA أعلاه وأدخله يدوياً.",
     ])
     caption = "\n".join(caption_lines)
-    kb = InlineKeyboardMarkup([[IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]])
+    kb = InlineKeyboardMarkup([[IKB("🏠 القائمة الرئيسية", callback_data="home")]])
 
     # Send QR photo (either stored QR image or dynamically generated from LPA)
     sent_photo = False
@@ -199,18 +224,18 @@ async def deliver_esim_to_chat(
             except TelegramError:
                 sent_photo = False
         if not sent_photo and qr_local_path and os.path.exists(qr_local_path):
-            with open(qr_local_path, "rb") as f:
-                await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=InputFile(f, filename="esim_qr.png"),
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb,
-                )
-                sent_photo = True
+            raw_bytes = await asyncio.to_thread(_read_binary_file, qr_local_path)
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=InputFile(io.BytesIO(raw_bytes), filename="esim_qr.png"),
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+            )
+            sent_photo = True
 
     if not sent_photo and lpa_code:
-        qr_bio = generate_qr_bytes(lpa_code)
+        qr_bio = await generate_qr_bytes_async(lpa_code)
         await context.bot.send_photo(
             chat_id=chat_id,
             photo=InputFile(qr_bio, filename=f"esim_{esim['id']}.png"),
@@ -229,49 +254,78 @@ async def deliver_esim_to_chat(
         )
 
 
+async def _send_with_flood_retry(send_coro_factory, max_retries: int = 3):
+    """Retry a Telegram send after the requested flood-wait delay."""
+    for attempt in range(max_retries + 1):
+        try:
+            return await send_coro_factory()
+        except RetryAfter as exc:
+            if attempt >= max_retries:
+                raise
+            await asyncio.sleep(float(exc.retry_after) + 0.25)
+
+
 async def broadcast_new_inventory(
     context: ContextTypes.DEFAULT_TYPE,
     plan_id: int,
     added_count: int,
+    mode: str = "all",
 ) -> Tuple[int, int]:
-    """Broadcasts a public Arabic notification to all non-banned users when new eSIMs are added."""
+    """Notify waitlisted users and/or all active users after a restock."""
+    if mode == "silent":
+        return 0, 0
     plan = db.get_plan(plan_id)
     if not plan:
         return 0, 0
     currency = get_currency()
-    users = db.get_all_active_users()
-
-    desc_line = f"\U0001f4dd <b>\u0627\u0644\u062a\u0641\u0627\u0635\u064a\u0644:</b> {html.escape(plan['description'])}\n" if plan.get("description") else ""
-    text = (
-        "\U0001f514 <b>\u0625\u0634\u0639\u0627\u0631 \u062a\u0648\u0641\u0631 \u0645\u062e\u0632\u0648\u0646 \u062c\u062f\u064a\u062f \u0645\u0646 \u0634\u0631\u0627\u0626\u062d eSIM!</b>\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001f30d <b>\u0627\u0644\u062f\u0648\u0644\u0629:</b> {html.escape(plan['country_name'])}\n"
-        f"\U0001f4e6 <b>\u0627\u0644\u0628\u0627\u0642\u0629:</b> {html.escape(plan['name'])}\n"
+    waitlisted = db.get_plan_alert_subscribers(plan_id)
+    waitlisted_ids = {int(u["user_id"]) for u in waitlisted}
+    desc_line = f"📝 <b>التفاصيل:</b> {html.escape(plan['description'])}\n" if plan.get("description") else ""
+    common = (
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌍 <b>الدولة:</b> {html.escape(plan['country_name'])}\n"
+        f"📦 <b>الباقة:</b> {html.escape(plan['name'])}\n"
         f"{desc_line}"
-        f"\U0001f4b5 <b>\u0627\u0644\u0633\u0639\u0631:</b> {float(plan['price']):.2f} {html.escape(currency)}\n"
-        f"\u2795 <b>\u0627\u0644\u0643\u0645\u064a\u0629 \u0627\u0644\u0645\u0636\u0627\u0641\u0629 \u0627\u0644\u0622\u0646:</b> {added_count} \u0634\u0631\u064a\u062d\u0629\n"
-        f"\u2705 <b>\u0625\u062c\u0645\u0627\u0644\u064a \u0627\u0644\u0645\u062a\u0627\u062d \u062d\u0627\u0644\u064a\u0627\u064b:</b> {plan['available_count']} \u0634\u0631\u064a\u062d\u0629\n\n"
-        "\U0001f447 <b>\u0627\u0636\u063a\u0637 \u0639\u0644\u0649 \u0627\u0644\u0632\u0631 \u0628\u0627\u0644\u0623\u0633\u0641\u0644 \u0644\u0634\u0631\u0627\u0621 \u0627\u0644\u0628\u0627\u0642\u0629 \u0641\u0648\u0631\u0627\u064b:</b>"
+        f"💵 <b>السعر:</b> {float(plan['price']):.2f} {html.escape(currency)}\n"
+        f"➕ <b>الكمية المضافة:</b> {added_count} شريحة\n"
+        f"✅ <b>المتاح الآن:</b> {plan['available_count']} شريحة\n\n"
+        "👇 <b>اضغط للشراء الآن:</b>"
     )
+    waitlist_text = "🎉 <b>توفرت الآن الباقة التي طلبت تنبيه توفرها!</b>\n" + common
+    public_text = "🔔 <b>إشعار توفر مخزون جديد من شرائح eSIM!</b>\n" + common
     kb = InlineKeyboardMarkup([
-        [IKB("\U0001f6d2 \u0634\u0631\u0627\u0621 \u0647\u0630\u0647 \u0627\u0644\u0628\u0627\u0642\u0629 \u0627\u0644\u0622\u0646", callback_data=f"u_plan:{plan_id}")],
-        [IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+        [IKB("🛒 شراء هذه الباقة الآن", callback_data=f"u_plan:{plan_id}")],
+        [IKB("🏠 القائمة الرئيسية", callback_data="home")],
     ])
-
-    sent = 0
-    failed = 0
-    for u in users:
-        try:
-            await context.bot.send_message(
-                chat_id=u["user_id"],
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb,
-            )
-            sent += 1
-            await asyncio.sleep(0.04)
-        except (Forbidden, BadRequest, TelegramError):
-            failed += 1
+    sent = failed = 0
+    delivered_waitlist: List[int] = []
+    if mode in ("all", "waitlist"):
+        for u in waitlisted:
+            uid = int(u["user_id"])
+            try:
+                await _send_with_flood_retry(lambda uid=uid: context.bot.send_message(
+                    chat_id=uid, text=waitlist_text, parse_mode=ParseMode.HTML, reply_markup=kb
+                ))
+                sent += 1
+                delivered_waitlist.append(uid)
+                await asyncio.sleep(0.04)
+            except (Forbidden, BadRequest, TelegramError):
+                failed += 1
+        if delivered_waitlist:
+            db.clear_plan_alerts(plan_id, delivered_waitlist)
+    if mode == "all":
+        for u in db.get_all_active_users():
+            uid = int(u["user_id"])
+            if uid in waitlisted_ids:
+                continue
+            try:
+                await _send_with_flood_retry(lambda uid=uid: context.bot.send_message(
+                    chat_id=uid, text=public_text, parse_mode=ParseMode.HTML, reply_markup=kb
+                ))
+                sent += 1
+                await asyncio.sleep(0.04)
+            except (Forbidden, BadRequest, TelegramError):
+                failed += 1
     return sent, failed
 
 
@@ -280,33 +334,40 @@ async def send_admin_sale_alert(
     buyer,
     esim: Dict[str, Any],
 ) -> None:
-    """
-    Notifies the owner of a sale, identifying exactly which eSIM was sold using
-    inventory identifiers only. Activation secrets (LPA code / QR image) are NOT
-    transmitted here; the owner can inspect the sold item by its inventory id.
-    """
+    """Notify the owner of the sale without sending activation secrets."""
     if not ADMIN_ID:
         return
     currency = get_currency()
     user_tag = f"@{buyer.username}" if getattr(buyer, "username", None) else (getattr(buyer, "full_name", "") or "")
-    item_label = "\u0643\u0648\u062f \u0646\u0635\u064a (LPA)" if esim.get("item_type") == "lpa" else "\u0635\u0648\u0631\u0629 QR"
-
+    items = esim.get("items") or [esim]
+    qty = len(items)
+    ids_str = ", ".join(f"#{it['id']}" for it in items)
+    total_paid = float(esim.get("total_paid") or esim.get("paid_price") or 0.0)
+    unit_price = float(esim.get("unit_price") or (total_paid / max(qty, 1)))
+    types_set = {it.get("item_type") for it in items}
+    item_label = "كود نصي (LPA)" if types_set == {"lpa"} else "صورة QR" if types_set == {"qr"} else "مختلط (LPA + QR)"
+    qty_line = f"🔢 <b>الكمية المباعة:</b> {qty} شرائح ({unit_price:.2f} × {qty})\n" if qty > 1 else ""
+    title = f"🛒 <b>عملية بيع {qty} شرائح eSIM جديدة!</b>" if qty > 1 else "🛒 <b>عملية بيع شريحة eSIM جديدة!</b>"
     text = (
-        "\U0001f6d2 <b>\u0639\u0645\u0644\u064a\u0629 \u0628\u064a\u0639 \u0634\u0631\u064a\u062d\u0629 eSIM \u062c\u062f\u064a\u062f\u0629!</b>\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001f464 <b>\u0627\u0644\u0639\u0645\u064a\u0644:</b> {html.escape(user_tag)} (<code>{buyer.id}</code>)\n"
-        f"\U0001f30d <b>\u0627\u0644\u062f\u0648\u0644\u0629:</b> {html.escape(str(esim.get('country_name', '')))}\n"
-        f"\U0001f4e6 <b>\u0627\u0644\u0628\u0627\u0642\u0629:</b> {html.escape(str(esim.get('plan_name', '')))}\n"
-        f"\U0001f4b5 <b>\u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0645\u062e\u0635\u0648\u0645:</b> {float(esim.get('paid_price') or 0):.2f} {html.escape(currency)}\n"
-        f"\U0001f194 <b>\u0631\u0642\u0645 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0627\u0644\u0645\u0628\u0627\u0639\u0629 \u0628\u0627\u0644\u0645\u062e\u0632\u0648\u0646:</b> #{esim['id']}\n"
-        f"\U0001f3f7 <b>\u0646\u0648\u0639 \u0627\u0644\u0634\u0631\u064a\u062d\u0629:</b> {item_label}\n"
-        f"\U0001f552 <b>\u0648\u0642\u062a \u0627\u0644\u0628\u064a\u0639:</b> {esim.get('sold_at') or ''}"
+        f"{title}\n━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>العميل:</b> {html.escape(user_tag)} (<code>{buyer.id}</code>)\n"
+        f"🌍 <b>الدولة:</b> {html.escape(str(esim.get('country_name', '')))}\n"
+        f"📦 <b>الباقة:</b> {html.escape(str(esim.get('plan_name', '')))}\n"
+        f"{qty_line}"
+        f"💵 <b>الإجمالي المخصوم:</b> {total_paid:.2f} {html.escape(currency)}\n"
+        f"🆔 <b>أرقام الشرائح بالمخزون:</b> {ids_str}\n"
+        f"🏷 <b>نوع الشريحة:</b> {item_label}\n"
+        f"🕒 <b>وقت البيع:</b> {esim.get('sold_at') or items[0].get('sold_at') or ''}"
     )
+    first_id = items[0]["id"]
+    kb = InlineKeyboardMarkup([[
+        IKB(f"🔍 فحص الشريحة #{first_id}", callback_data=f"adm_esim_item:{first_id}"),
+        IKB("👤 ملف المشتري", callback_data=f"adm_user_view:{buyer.id}"),
+    ]])
     try:
-        await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode=ParseMode.HTML)
+        await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode=ParseMode.HTML, reply_markup=kb)
     except TelegramError as exc:
         logger.warning("Failed to notify admin of sale: %s", exc)
-
 
 async def send_refund_video_to_admin(
     context: ContextTypes.DEFAULT_TYPE,
@@ -318,17 +379,17 @@ async def send_refund_video_to_admin(
         return
     currency = get_currency()
     caption = (
-        f"\u21a9\ufe0f <b>\u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f \u062c\u062f\u064a\u062f #{req['id']}</b>\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001f464 <b>\u0627\u0644\u0639\u0645\u064a\u0644:</b> {html.escape(req.get('full_name') or '')} (@{html.escape(req.get('username') or NO_USER)})\n"
-        f"\U0001f194 <b>\u0645\u0639\u0631\u0641 \u0627\u0644\u0639\u0645\u064a\u0644:</b> <code>{req['user_id']}</code>\n"
-        f"\U0001f4f2 <b>\u0631\u0642\u0645 \u0627\u0644\u0634\u0631\u064a\u062d\u0629:</b> #{req['esim_id']}\n"
-        f"\U0001f30d <b>\u0627\u0644\u062f\u0648\u0644\u0629:</b> {html.escape(str(req.get('country_name') or ''))}\n"
-        f"\U0001f4e6 <b>\u0627\u0644\u0628\u0627\u0642\u0629:</b> {html.escape(str(req.get('plan_name') or ''))}\n"
-        f"\U0001f4b5 <b>\u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0645\u062f\u0641\u0648\u0639 \u0644\u0644\u0634\u0631\u064a\u062d\u0629:</b> <code>{float(req.get('refund_amount') or 0):.2f}</code> {html.escape(currency)}\n"
-        f"\U0001f4dd <b>\u0648\u0635\u0641 \u0627\u0644\u0645\u0634\u0643\u0644\u0629:</b> {html.escape(req.get('reason') or NONE_STR)}\n"
-        f"\U0001f4c5 <b>\u0627\u0644\u062a\u0627\u0631\u064a\u062e:</b> {req.get('created_at', '')}\n\n"
-        "\U0001f3ac <b>\u0641\u064a\u062f\u064a\u0648 \u0625\u062b\u0628\u0627\u062a \u0627\u0644\u0645\u0634\u0643\u0644\u0629 \u0645\u0631\u0641\u0642 \u0645\u0639 \u0647\u0630\u0627 \u0627\u0644\u0637\u0644\u0628.</b>"
+        f"↩️ <b>طلب استرداد جديد #{req['id']}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>العميل:</b> {html.escape(req.get('full_name') or '')} (@{html.escape(req.get('username') or NO_USER)})\n"
+        f"🆔 <b>معرف العميل:</b> <code>{req['user_id']}</code>\n"
+        f"📲 <b>رقم الشريحة:</b> #{req['esim_id']}\n"
+        f"🌍 <b>الدولة:</b> {html.escape(str(req.get('country_name') or ''))}\n"
+        f"📦 <b>الباقة:</b> {html.escape(str(req.get('plan_name') or ''))}\n"
+        f"💵 <b>السعر المدفوع للشريحة:</b> <code>{float(req.get('refund_amount') or 0):.2f}</code> {html.escape(currency)}\n"
+        f"📝 <b>وصف المشكلة:</b> {html.escape(req.get('reason') or NONE_STR)}\n"
+        f"📅 <b>التاريخ:</b> {req.get('created_at', '')}\n\n"
+        "🎬 <b>فيديو إثبات المشكلة مرفق مع هذا الطلب.</b>"
     )
     video_file_id = req.get("video_file_id", "")
     video_type = req.get("video_type", "video")
@@ -345,7 +406,7 @@ async def send_refund_video_to_admin(
         try:
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
-                text=caption + "\n\n\u26a0\ufe0f \u062a\u0639\u0630\u0631 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0641\u064a\u062f\u064a\u0648 \u062a\u0644\u0642\u0627\u0626\u064a\u0627\u064b\u060c \u064a\u0631\u062c\u0649 \u0645\u0631\u0627\u062c\u0639\u0629 \u0627\u0644\u0637\u0644\u0628 \u0645\u0646 \u0644\u0648\u062d\u0629 \u0627\u0644\u062a\u062d\u0643\u0645.",
+                text=caption + "\n\n⚠️ تعذر إرسال الفيديو تلقائياً، يرجى مراجعة الطلب من لوحة التحكم.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=markup,
             )
@@ -365,13 +426,13 @@ _InlineKeyboardButtonBase = InlineKeyboardButton
 
 def _infer_button_style(text, callback_data=None, url=None):
     t = text or ""
-    if any(k in t for k in ("\u274c", "\u26d4", "\U0001f6ab", "\U0001f5d1",
-                            "\u0625\u0644\u063a\u0627\u0621", "\u0631\u0641\u0636",
-                            "\u062d\u0630\u0641", "\u062d\u0638\u0631")):
+    if any(k in t for k in ("❌", "⛔", "🚫", "🗑",
+                            "إلغاء", "رفض",
+                            "حذف", "حظر")):
         return "danger"
-    if any(k in t for k in ("\u2705", "\u2714", "\U0001f6d2", "\U0001f4b3", "\u2795",
-                            "\u062a\u0623\u0643\u064a\u062f", "\u0645\u0648\u0627\u0641\u0642\u0629",
-                            "\u0634\u062d\u0646", "\u0634\u0631\u0627\u0621")):
+    if any(k in t for k in ("✅", "✔", "🛒", "💳", "➕",
+                            "تأكيد", "موافقة",
+                            "شحن", "شراء")):
         return "success"
     return "primary"
 
@@ -389,32 +450,32 @@ def IKB(text, callback_data=None, url=None, style=None, **kwargs):
 
 def build_home_keyboard(user_id: int) -> InlineKeyboardMarkup:
     rows = [
-        [IKB("\U0001f6d2 \u0634\u0631\u0627\u0621 \u0634\u0631\u064a\u062d\u0629 eSIM", callback_data="u_countries")],
+        [IKB("🛒 شراء شريحة eSIM", callback_data="u_countries")],
         [
-            IKB("\U0001f4b3 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f", callback_data="u_topup"),
-            IKB("\U0001f4b0 \u0631\u0635\u064a\u062f\u064a \u0648\u062d\u0633\u0627\u0628\u064a", callback_data="u_account"),
+            IKB("💳 شحن الرصيد", callback_data="u_topup"),
+            IKB("💰 رصيدي وحسابي", callback_data="u_account"),
         ],
         [
-            IKB("\U0001f4e6 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a \u0627\u0644\u0633\u0627\u0628\u0642\u0629", callback_data="u_purchases"),
-            IKB("\u21a9\ufe0f \u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f", callback_data="u_refund"),
+            IKB("📦 مشترياتي السابقة", callback_data="u_purchases"),
+            IKB("↩️ طلب استرداد", callback_data="u_refund"),
         ],
-        [IKB("\U0001f6df \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a", callback_data="u_support")],
+        [IKB("🛟 الدعم الفني", callback_data="u_support")],
     ]
     if is_admin(user_id):
-        rows.append([IKB("\U0001f6e0 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646 (\u0627\u0644\u0645\u0627\u0644\u0643)", callback_data="adm_home")])
+        rows.append([IKB("🛠 لوحة تحكم الأدمن (المالك)", callback_data="adm_home")])
     return InlineKeyboardMarkup(rows)
 
 
 # ==============================================================================
 # Persistent Bottom Reply Keyboard (colored quick menu)
 # ==============================================================================
-BTN_STORE = "\U0001f6cd\ufe0f \u0627\u0644\u0645\u062a\u062c\u0631"
-BTN_TOPUP = "\U0001f4b3 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f"
-BTN_ACCOUNT = "\U0001f4b0 \u0631\u0635\u064a\u062f\u064a \u0648\u062d\u0633\u0627\u0628\u064a"
-BTN_PURCHASES = "\U0001f4e6 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a"
-BTN_REFUND = "\u21a9\ufe0f \u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f"
-BTN_SUPPORT = "\U0001f6df \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a"
-BTN_ADMIN = "\U0001f6e0\ufe0f \u0644\u0648\u062d\u0629 \u0627\u0644\u0623\u062f\u0645\u0646"
+BTN_STORE = "🛍️ المتجر"
+BTN_TOPUP = "💳 شحن الرصيد"
+BTN_ACCOUNT = "💰 رصيدي وحسابي"
+BTN_PURCHASES = "📦 مشترياتي"
+BTN_REFUND = "↩️ طلب استرداد"
+BTN_SUPPORT = "🛟 الدعم الفني"
+BTN_ADMIN = "🛠️ لوحة الأدمن"
 
 REPLY_MENU_ACTIONS = {
     BTN_STORE: "u_countries",
@@ -429,18 +490,18 @@ REPLY_MENU_ACTIONS = {
 # Keywords from older bottom-keyboard layouts so legacy buttons keep working
 # until every client receives the refreshed keyboard (matched in order).
 MENU_KEYWORD_ACTIONS = [
-    ("\u0634\u062d\u0646", "u_topup"),
-    ("\u0627\u0633\u062a\u0631\u062f\u0627\u062f", "u_refund"),
-    ("\u0631\u0635\u064a\u062f\u064a", "u_account"),
-    ("\u062d\u0633\u0627\u0628\u064a", "u_account"),
-    ("\u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a", "u_purchases"),
-    ("\u0637\u0644\u0628\u0627\u062a\u064a", "u_purchases"),
-    ("\u0645\u0646\u062a\u062c\u0627\u062a\u064a", "u_purchases"),
-    ("\u0627\u0644\u062f\u0639\u0645", "u_support"),
-    ("\u0627\u0644\u0623\u062f\u0645\u0646", "adm_home"),
-    ("\u0627\u0644\u0645\u062a\u062c\u0631", "u_countries"),
-    ("\u0627\u0644\u0645\u062e\u0632\u0648\u0646", "u_countries"),
-    ("\u0627\u0644\u0634\u0631\u0627\u0626\u062d", "u_countries"),
+    ("شحن", "u_topup"),
+    ("استرداد", "u_refund"),
+    ("رصيدي", "u_account"),
+    ("حسابي", "u_account"),
+    ("مشترياتي", "u_purchases"),
+    ("طلباتي", "u_purchases"),
+    ("منتجاتي", "u_purchases"),
+    ("الدعم", "u_support"),
+    ("الأدمن", "adm_home"),
+    ("المتجر", "u_countries"),
+    ("المخزون", "u_countries"),
+    ("الشرائح", "u_countries"),
 ]
 
 
@@ -537,16 +598,16 @@ async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user:
         return
-    u_row = db.upsert_user(user.id, user.username, user.full_name)
+    u_row = ensure_user_synced(user, context)
     currency = get_currency()
 
     text = (
-        f"\U0001f44b <b>\u0623\u0647\u0644\u0627\u064b \u0628\u0643 \u064a\u0627 {html.escape(user.first_name or DEFAULT_CUSTOMER)} \u0641\u064a \u0645\u062a\u062c\u0631 \u0634\u0631\u0627\u0626\u062d eSIM \u0627\u0644\u0631\u0642\u0645\u064a\u0629!</b>\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        "\U0001f310 \u0646\u0642\u062f\u0645 \u0644\u0643 \u0634\u0631\u0627\u0626\u062d \u0627\u062a\u0635\u0627\u0644 \u0625\u0644\u0643\u062a\u0631\u0648\u0646\u064a\u0629 (eSIM) \u0641\u0648\u0631\u064a\u0629 \u0644\u062c\u0645\u064a\u0639 \u062f\u0648\u0644 \u0627\u0644\u0639\u0627\u0644\u0645 \u0628\u0623\u0633\u0639\u0627\u0631 \u062a\u0646\u0627\u0641\u0633\u064a\u0629 \u0648\u0627\u0633\u062a\u0644\u0627\u0645 \u0641\u0648\u0631\u064a \u0644\u0643\u0648\u062f \u0627\u0644\u0640 QR.\n\n"
-        f"\U0001f194 <b>\u0645\u0639\u0631\u0641 \u062d\u0633\u0627\u0628\u0643:</b> <code>{user.id}</code>\n"
-        f"\U0001f4b0 <b>\u0631\u0635\u064a\u062f\u0643 \u0627\u0644\u062d\u0627\u0644\u064a:</b> <code>{float(u_row['balance']):.2f}</code> {html.escape(currency)}\n\n"
-        "\U0001f447 <b>\u0627\u062e\u062a\u0631 \u0645\u0646 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062a\u0627\u0644\u064a\u0629 \u0645\u0627 \u064a\u0646\u0627\u0633\u0628\u0643:</b>"
+        f"👋 <b>أهلاً بك يا {html.escape(user.first_name or DEFAULT_CUSTOMER)} في متجر شرائح eSIM الرقمية!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🌐 نقدم لك شرائح اتصال إلكترونية (eSIM) فورية لجميع دول العالم بأسعار تنافسية واستلام فوري لكود الـ QR.\n\n"
+        f"🆔 <b>معرف حسابك:</b> <code>{user.id}</code>\n"
+        f"💰 <b>رصيدك الحالي:</b> <code>{float(u_row['balance']):.2f}</code> {html.escape(currency)}\n\n"
+        "👇 <b>اختر من القائمة التالية ما يناسبك:</b>"
     )
     if update.callback_query:
         await safe_edit_or_send(update, text)
@@ -558,55 +619,167 @@ async def show_admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
     if not user or not is_admin(user.id):
         if update.callback_query:
-            await update.callback_query.answer("\u26d4 \u0647\u0630\u0647 \u0627\u0644\u0644\u0648\u062d\u0629 \u0645\u062e\u0635\u0635\u0629 \u0644\u0645\u0627\u0644\u0643 \u0627\u0644\u0628\u0648\u062a \u0641\u0642\u0637.", show_alert=True)
+            await update.callback_query.answer("⛔ هذه اللوحة مخصصة لمالك البوت فقط.", show_alert=True)
         return
     clear_state(context)
     stats = db.get_stats()
     currency = get_currency()
 
     text = (
-        "\U0001f6e0 <b>\u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0645\u0627\u0644\u0643 (Admin Panel)</b>\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001f465 <b>\u0625\u062c\u0645\u0627\u0644\u064a \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u064a\u0646:</b> {stats['total_users']} (\u0627\u0644\u0645\u062d\u0638\u0648\u0631\u064a\u0646: {stats['banned_users']})\n"
-        f"\U0001f30d <b>\u0639\u062f\u062f \u0627\u0644\u062f\u0648\u0644 \u0627\u0644\u0645\u0636\u0627\u0641\u0629:</b> {stats['total_countries']}\n"
-        f"\U0001f4e6 <b>\u0639\u062f\u062f \u0627\u0644\u0628\u0627\u0642\u0627\u062a:</b> {stats['total_plans']}\n"
-        f"\U0001f4f2 <b>\u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0627\u0644\u0645\u062a\u0627\u062d\u0629 \u0628\u0627\u0644\u0645\u062e\u0632\u0648\u0646:</b> {stats['available_esims']}\n"
-        f"\u2705 <b>\u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0627\u0644\u0645\u0628\u0627\u0639\u0629:</b> {stats['sold_esims']}\n"
-        f"\U0001f4b5 <b>\u0625\u062c\u0645\u0627\u0644\u064a \u0627\u0644\u0645\u0628\u064a\u0639\u0627\u062a:</b> {stats['total_revenue']:.2f} {html.escape(currency)}\n"
-        f"\u23f3 <b>\u0637\u0644\u0628\u0627\u062a \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0627\u0644\u0645\u0639\u0644\u0642\u0629:</b> {stats['pending_topups']}\n"
-        f"\u21a9\ufe0f <b>\u0637\u0644\u0628\u0627\u062a \u0627\u0644\u0627\u0633\u062a\u0631\u062f\u0627\u062f \u0627\u0644\u0645\u0639\u0644\u0642\u0629:</b> {stats['pending_refunds']}\n\n"
-        "\U0001f447 <b>\u0627\u062e\u062a\u0631 \u0627\u0644\u0642\u0633\u0645 \u0627\u0644\u0630\u064a \u062a\u0631\u064a\u062f \u0625\u062f\u0627\u0631\u062a\u0647:</b>"
+        "🛠 <b>لوحة تحكم المالك (Admin Panel)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 <b>إجمالي المستخدمين:</b> {stats['total_users']} (المحظورين: {stats['banned_users']})\n"
+        f"🌍 <b>عدد الدول المضافة:</b> {stats['total_countries']}\n"
+        f"📦 <b>عدد الباقات:</b> {stats['total_plans']}\n"
+        f"📲 <b>الشرائح المتاحة بالمخزون:</b> {stats['available_esims']}\n"
+        f"✅ <b>الشرائح المباعة:</b> {stats['sold_esims']}\n"
+        f"💵 <b>إجمالي المبيعات:</b> {stats['total_revenue']:.2f} {html.escape(currency)}\n"
+        f"⏳ <b>طلبات شحن الرصيد المعلقة:</b> {stats['pending_topups']}\n"
+        f"↩️ <b>طلبات الاسترداد المعلقة:</b> {stats['pending_refunds']}\n"
+        f"🔔 <b>تنبيهات توفر نشطة:</b> {stats.get('active_stock_alerts', 0)}\n\n"
+        "👇 <b>اختر القسم الذي تريد إدارته:</b>"
     )
     kb = InlineKeyboardMarkup([
         [
-            IKB("\U0001f30d \u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u062f\u0648\u0644", callback_data="adm_countries"),
-            IKB("\U0001f4e6 \u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0628\u0627\u0642\u0627\u062a", callback_data="adm_plans_SelectCountry"),
+            IKB("🌍 إدارة الدول", callback_data="adm_countries"),
+            IKB("📦 إدارة الباقات", callback_data="adm_plans_SelectCountry"),
         ],
         [
-            IKB("\U0001f4f2 \u0625\u062f\u0627\u0631\u0629 \u0645\u062e\u0632\u0648\u0646 \u0627\u0644\u0634\u0631\u0627\u0626\u062d (eSIMs)", callback_data="adm_inv_SelectCountry"),
+            IKB("📲 إدارة مخزون الشرائح (eSIMs)", callback_data="adm_inv_SelectCountry"),
+        ],
+        [
+            IKB("📊 تقارير الأرباح وCSV", callback_data="adm_analytics"),
+            IKB("🔍 فحص شريحة / عميل", callback_data="adm_inspector"),
         ],
         [
             IKB(
-                f"\U0001f4b3 \u0637\u0644\u0628\u0627\u062a \u0627\u0644\u0634\u062d\u0646 \u0648\u0627\u0644\u0623\u0631\u0635\u062f\u0629 ({stats['pending_topups']})",
+                f"💳 طلبات الشحن والأرصدة ({stats['pending_topups']})",
                 callback_data="adm_topups_menu",
             ),
         ],
         [
             IKB(
-                f"\u21a9\ufe0f \u0637\u0644\u0628\u0627\u062a \u0627\u0644\u0627\u0633\u062a\u0631\u062f\u0627\u062f ({stats['pending_refunds']})",
+                f"↩️ طلبات الاسترداد ({stats['pending_refunds']})",
                 callback_data="adm_refunds_menu",
             ),
         ],
         [
-            IKB("\U0001f465 \u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u064a\u0646 \u0648\u0627\u0644\u062d\u0638\u0631", callback_data="adm_users_menu"),
-            IKB("\U0001f4e2 \u0631\u0633\u0627\u0644\u0629 \u062c\u0645\u0627\u0639\u064a\u0629 \u0644\u0644\u0643\u0644", callback_data="adm_broadcast_start"),
+            IKB("👥 إدارة المستخدمين والحظر", callback_data="adm_users_menu"),
+            IKB("📢 رسالة جماعية للكل", callback_data="adm_broadcast_start"),
         ],
         [
-            IKB("\u2699\ufe0f \u0625\u0639\u062f\u0627\u062f\u0627\u062a \u0627\u0644\u062f\u0641\u0639 \u0648\u0627\u0644\u062f\u0639\u0645", callback_data="adm_settings"),
+            IKB("⚙️ إعدادات الدفع والدعم", callback_data="adm_settings"),
         ],
-        [IKB("\U0001f3e0 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0648\u0627\u062c\u0647\u0629 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645", callback_data="home")],
+        [IKB("🏠 العودة لواجهة المستخدم", callback_data="home")],
     ])
     await safe_edit_or_send(update, text, kb)
+
+
+async def render_user_plan_view(update, context, user, plan_id: int, qty: int = 1) -> None:
+    plan = db.get_plan(plan_id)
+    if not plan:
+        await show_home(update, context)
+        return
+    currency = get_currency()
+    u_row = db.get_user(user.id)
+    if not u_row:
+        u_row = ensure_user_synced(user, context)
+    available = int(plan.get("available_count") or 0)
+    balance = float(u_row.get("balance") or 0)
+    unit = round(float(plan["price"]), 2)
+    max_qty = max(1, min(available, 10))
+    qty = max(1, min(int(qty), max_qty))
+    total = round(unit * qty, 2)
+    stock = f"✅ متوفر للاستلام الفوري ({available} شريحة)" if available else "❌ نفدت الكمية حالياً"
+    desc = f"📝 <b>تفاصيل الباقة:</b>\n{html.escape(plan['description'])}\n\n" if plan.get("description") else ""
+    qty_lines = ""
+    if available > 1:
+        qty_lines = f"🔢 <b>الكمية المختارة:</b> {qty} شريحة\n🧾 <b>الإجمالي:</b> <code>{total:.2f}</code> {html.escape(currency)}\n"
+    text = (
+        "📦 <b>تفاصيل الباقة المختارة</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌍 <b>الدولة:</b> {html.escape(plan['country_name'])}\n"
+        f"🏷 <b>الباقة:</b> {html.escape(plan['name'])}\n"
+        f"💵 <b>سعر الشريحة الواحدة:</b> <code>{unit:.2f}</code> {html.escape(currency)}\n"
+        f"{qty_lines}📊 <b>حالة المخزون:</b> {stock}\n\n{desc}"
+        f"💰 <b>رصيدك الحالي:</b> <code>{balance:.2f}</code> {html.escape(currency)}"
+    )
+    rows = []
+    if available:
+        if available > 1:
+            rows.append([
+                IKB("➖", callback_data=f"u_plan:{plan_id}:{max(1, qty-1)}"),
+                IKB(f"🔢 الكمية: {qty}/{max_qty}", callback_data=f"u_plan:{plan_id}:{qty}"),
+                IKB("➕", callback_data=f"u_plan:{plan_id}:{min(max_qty, qty+1)}"),
+            ])
+        if balance >= total:
+            label = f"✅ تأكيد شراء {qty} شرائح ({total:.2f} {currency})" if qty > 1 else f"✅ تأكيد الشراء ({total:.2f} {currency})"
+            rows.append([IKB(label, callback_data=f"u_buy_confirm:{plan_id}:{qty}", style="success")])
+        else:
+            diff = round(total - balance, 2)
+            text += f"\n\n⚠️ <b>رصيدك غير كافٍ لهذه الكمية. تحتاج إلى شحن <code>{diff:.2f}</code> {html.escape(currency)} إضافية.</b>"
+            rows.append([IKB("💳 شحن الرصيد الآن", callback_data="u_topup")])
+    else:
+        if db.has_stock_alert(user.id, plan_id):
+            text += "\n\n🔔 <b>تنبيه التوفر مفعّل لديك لهذه الباقة.</b>"
+            rows.append([IKB("🔕 إلغاء تنبيه التوفر", callback_data=f"u_alert_toggle:{plan_id}", style="danger")])
+        else:
+            text += "\n\n💡 فعّل التنبيه ليصلك إشعار فور توفر الباقة من جديد."
+            rows.append([IKB("🔔 أعلمني فور توفر هذه الباقة", callback_data=f"u_alert_toggle:{plan_id}", style="success")])
+    rows += [
+        [IKB("🔙 العودة لباقات الدولة", callback_data=f"u_country:{plan['country_id']}")],
+        [IKB("🏠 القائمة الرئيسية", callback_data="home")],
+    ]
+    await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
+
+
+async def render_admin_add_esim(update, context, plan_id: int, mode: str = "all") -> None:
+    plan = db.get_plan(plan_id)
+    if not plan:
+        return
+    mode = mode if mode in ("all", "waitlist", "silent") else "all"
+    wait_count = db.get_plan_alert_count(plan_id)
+    context.user_data["state"] = "ADM_ADD_ESIM"
+    context.user_data["temp"] = {"plan_id": plan_id, "notify_mode": mode}
+    labels = {
+        "all": "📢 إشعار عام للكل + المنتظرين",
+        "waitlist": f"🔔 للمنتظرين فقط ({wait_count} عميل)",
+        "silent": "🔕 إضافة صامتة بدون إشعارات",
+    }
+    text = (
+        "➕ <b>إضافة شرائح eSIM إلى المخزون</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌍 <b>الدولة:</b> {html.escape(plan['country_name'])}\n"
+        f"📦 <b>الباقة:</b> {html.escape(plan['name'])}\n"
+        f"🔔 <b>المنتظرون:</b> {wait_count} عميل\n"
+        f"📡 <b>وضع الإشعار:</b> {labels[mode]}\n\n"
+        "أرسل كود LPA أو عدة أكواد (كل كود في سطر)، أو أرسل صورة QR. الأكواد المكررة سيتم تجاهلها."
+    )
+    kb = InlineKeyboardMarkup([
+        [IKB(f"{'✅ ' if mode == 'all' else ''}📢 للكل", callback_data=f"adm_esim_mode:{plan_id}:all"),
+         IKB(f"{'✅ ' if mode == 'waitlist' else ''}🔔 للمنتظرين", callback_data=f"adm_esim_mode:{plan_id}:waitlist")],
+        [IKB(f"{'✅ ' if mode == 'silent' else ''}🔕 صامت", callback_data=f"adm_esim_mode:{plan_id}:silent")],
+        [IKB("🔙 إلغاء والعودة للباقة", callback_data=f"adm_plan_view:{plan_id}")],
+    ])
+    await safe_edit_or_send(update, text, kb)
+
+
+async def render_admin_user_profile(update, target: Dict[str, Any]) -> None:
+    currency=get_currency(); uid=int(target["user_id"])
+    purchases=db.get_user_purchases(uid)
+    uname="@"+html.escape(target["username"]) if target.get("username") else "بدون يوزر"
+    status="🚫 محظور" if target.get("is_banned") else "✅ نشط"
+    text=(
+        "👤 <b>ملف العميل</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏷 الاسم: {html.escape(target.get('full_name') or NONE_STR)}\n🔗 اليوزر: {uname}\n🆔 ID: <code>{uid}</code>\n"
+        f"🛡 الحالة: {status}\n💰 الرصيد: <code>{float(target.get('balance') or 0):.2f}</code> {html.escape(currency)}\n"
+        f"📲 المشتريات: {target.get('purchases_count',len(purchases))} | 💵 الإنفاق: <code>{float(target.get('total_spent') or 0):.2f}</code> {html.escape(currency)}\n"
+        f"💳 الشحن المقبول: {target.get('approved_topups_count',0)} (<code>{float(target.get('approved_topups_sum') or 0):.2f}</code>)\n"
+        f"⏳ الشحن المعلق: {target.get('pending_topups_count',0)} | ↩️ الاستردادات: {target.get('refunds_count',0)} | 🔔 تنبيهات التوفر: {target.get('stock_alerts_count',0)}"
+    )
+    rows=[[IKB("💰 تعديل الرصيد",callback_data=f"adm_bal_user:{uid}"),IKB("🔓 فك الحظر" if target.get("is_banned") else "🚫 حظر",callback_data=f"adm_toggle_ban_view:{uid}")]]
+    for e in purchases[:8]:
+        rows.append([IKB(f"📲 #{e['id']} | {e['country_name']} - {e['plan_name']}",callback_data=f"adm_esim_item:{e['id']}")])
+    rows += [[IKB("🔎 بحث عن عميل آخر",callback_data="adm_lookup_user"),IKB("🔍 مركز الفحص",callback_data="adm_inspector")],[IKB("🔙 لوحة الأدمن",callback_data="adm_home")]]
+    await safe_edit_or_send(update,text,InlineKeyboardMarkup(rows))
 
 
 # ==============================================================================
@@ -618,8 +791,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         banned = (not is_admin(user.id)) and db.is_user_banned(user.id)
         if not banned:
             await update.message.reply_text(
-                "\u2328\ufe0f <b>\u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0633\u0641\u0644\u064a\u0629 \u0627\u0644\u0645\u0644\u0648\u0651\u0646\u0629 \u062c\u0627\u0647\u0632\u0629!</b>\n"
-                "\u0627\u0633\u062a\u062e\u062f\u0645 \u0627\u0644\u0623\u0632\u0631\u0627\u0631 \u0628\u0627\u0644\u0623\u0633\u0641\u0644 \u0644\u0644\u062a\u0646\u0642\u0644 \u0627\u0644\u0633\u0631\u064a\u0639 \u062f\u0627\u062e\u0644 \u0627\u0644\u0645\u062a\u062c\u0631 \U0001f447",
+                "⌨️ <b>القائمة السفلية الملوّنة جاهزة!</b>\n"
+                "استخدم الأزرار بالأسفل للتنقل السريع داخل المتجر 👇",
                 parse_mode=ParseMode.HTML,
                 reply_markup=build_reply_keyboard(user.id),
             )
@@ -628,7 +801,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not is_admin(update.effective_user.id):
-        await update.message.reply_text("\u26d4 \u0639\u0630\u0631\u0627\u064b\u060c \u0647\u0630\u0627 \u0627\u0644\u0623\u0645\u0631 \u0645\u062e\u0635\u0635 \u0644\u0645\u0627\u0644\u0643 \u0627\u0644\u0628\u0648\u062a \u0641\u0642\u0637.")
+        await update.message.reply_text("⛔ عذراً، هذا الأمر مخصص لمالك البوت فقط.")
         return
     await show_admin_home(update, context)
 
@@ -646,9 +819,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
     currency = get_currency()
 
-    # Ensure user exists in DB
-    db.upsert_user(user.id, user.username, user.full_name)
-
     # ---------------- HOME ----------------
     if data == "home":
         await q.answer()
@@ -661,17 +831,18 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         u_row = db.get_user(user.id)
         purchases = db.get_user_purchases(user.id)
         text = (
-            "\U0001f4b0 <b>\u062a\u0641\u0627\u0635\u064a\u0644 \u062d\u0633\u0627\u0628\u064a \u0648\u0631\u0635\u064a\u062f\u064a</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            f"\U0001f464 <b>\u0627\u0644\u0627\u0633\u0645:</b> {html.escape(user.full_name or '')}\n"
-            f"\U0001f194 <b>\u0627\u0644\u0645\u0639\u0631\u0641 (ID):</b> <code>{user.id}</code>\n"
-            f"\U0001f4b5 <b>\u0627\u0644\u0631\u0635\u064a\u062f \u0627\u0644\u0645\u062a\u0627\u062d:</b> <code>{float(u_row['balance']):.2f}</code> {html.escape(currency)}\n"
-            f"\U0001f4e6 <b>\u0625\u062c\u0645\u0627\u0644\u064a \u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0627\u0644\u0645\u0634\u062a\u0631\u0627\u0629:</b> {len(purchases)} \u0634\u0631\u064a\u062d\u0629\n"
+            "💰 <b>تفاصيل حسابي ورصيدي</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>الاسم:</b> {html.escape(user.full_name or '')}\n"
+            f"🆔 <b>المعرف (ID):</b> <code>{user.id}</code>\n"
+            f"💵 <b>الرصيد المتاح:</b> <code>{float(u_row['balance']):.2f}</code> {html.escape(currency)}\n"
+            f"📦 <b>إجمالي الشرائح المشتراة:</b> {len(purchases)} شريحة\n"
         )
         kb = InlineKeyboardMarkup([
-            [IKB("\U0001f4b3 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0627\u0644\u0622\u0646", callback_data="u_topup")],
-            [IKB("\U0001f4e6 \u0639\u0631\u0636 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a", callback_data="u_purchases")],
-            [IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+            [IKB("💳 شحن الرصيد الآن", callback_data="u_topup")],
+            [IKB("📦 عرض مشترياتي", callback_data="u_purchases")],
+            [IKB("📜 سجل طلبات الشحن", callback_data="u_topup_history:0")],
+            [IKB("🏠 القائمة الرئيسية", callback_data="home")],
         ])
         await safe_edit_or_send(update, text, kb)
         return
@@ -680,15 +851,15 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await q.answer()
         support_user = db.get_setting("support_username", "Support").lstrip("@")
         text = (
-            "\U0001f6df <b>\u0645\u0631\u0643\u0632 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a \u0648\u062e\u062f\u0645\u0629 \u0627\u0644\u0639\u0645\u0644\u0627\u0621</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            "\u0625\u0630\u0627 \u0648\u0627\u062c\u0647\u062a\u0643 \u0623\u064a \u0645\u0634\u0643\u0644\u0629 \u0641\u064a \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0623\u0648 \u062a\u0641\u0639\u064a\u0644 \u0634\u0631\u064a\u062d\u0629 \u0627\u0644\u0640 eSIM \u0627\u0644\u062e\u0627\u0635\u0629 \u0628\u0643\u060c \u064a\u0633\u0639\u062f\u0646\u0627 \u062a\u0648\u0627\u0635\u0644\u0643 \u0645\u0639\u0646\u0627 \u0645\u0628\u0627\u0634\u0631\u0629:\n\n"
-            f"\U0001f468\u200d\U0001f4bb <b>\u062d\u0633\u0627\u0628 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a:</b> @{html.escape(support_user)}\n"
-            f"\U0001f194 <b>\u0645\u0639\u0631\u0641 \u062d\u0633\u0627\u0628\u0643 \u0644\u062a\u0632\u0648\u064a\u062f \u0627\u0644\u062f\u0639\u0645 \u0628\u0647:</b> <code>{user.id}</code>"
+            "🛟 <b>مركز الدعم الفني وخدمة العملاء</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "إذا واجهتك أي مشكلة في شحن الرصيد أو تفعيل شريحة الـ eSIM الخاصة بك، يسعدنا تواصلك معنا مباشرة:\n\n"
+            f"👨‍💻 <b>حساب الدعم الفني:</b> @{html.escape(support_user)}\n"
+            f"🆔 <b>معرف حسابك لتزويد الدعم به:</b> <code>{user.id}</code>"
         )
         kb = InlineKeyboardMarkup([
-            [IKB("\U0001f4ac \u0645\u0631\u0627\u0633\u0644\u0629 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a \u0645\u0628\u0627\u0634\u0631\u0629", url=f"https://t.me/{support_user}")],
-            [IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+            [IKB("💬 مراسلة الدعم الفني مباشرة", url=f"https://t.me/{support_user}")],
+            [IKB("🏠 القائمة الرئيسية", callback_data="home")],
         ])
         await safe_edit_or_send(update, text, kb)
         return
@@ -699,29 +870,29 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         countries = db.get_countries()
         if not countries:
             text = (
-                "\U0001f30d <b>\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062f\u0648\u0644 \u0627\u0644\u0645\u062a\u0627\u062d\u0629</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u26a0\ufe0f \u0644\u0627 \u062a\u0648\u062c\u062f \u062f\u0648\u0644 \u0645\u0636\u0627\u0641\u0629 \u062d\u0627\u0644\u064a\u0627\u064b \u0641\u064a \u0627\u0644\u0645\u062a\u062c\u0631. \u064a\u0631\u062c\u0649 \u0627\u0644\u0645\u062d\u0627\u0648\u0644\u0629 \u0644\u0627\u062d\u0642\u0627\u064b."
+                "🌍 <b>قائمة الدول المتاحة</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "⚠️ لا توجد دول مضافة حالياً في المتجر. يرجى المحاولة لاحقاً."
             )
-            kb = InlineKeyboardMarkup([[IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]])
+            kb = InlineKeyboardMarkup([[IKB("🏠 القائمة الرئيسية", callback_data="home")]])
             await safe_edit_or_send(update, text, kb)
             return
 
         rows = []
         for c in countries:
             stock = int(c["available_stock"] or 0)
-            badge = f"\u2705 ({stock})" if stock > 0 else "\u274c \u0646\u0641\u062f"
+            badge = f"✅ ({stock})" if stock > 0 else "❌ نفد"
             rows.append([
                 IKB(
-                    f"{c['name']} \u2014 {badge}",
+                    f"{c['name']} — {badge}",
                     callback_data=f"u_country:{c['id']}",
                 )
             ])
-        rows.append([IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
+        rows.append([IKB("🏠 القائمة الرئيسية", callback_data="home")])
         text = (
-            "\U0001f30d <b>\u0627\u062e\u062a\u0631 \u0627\u0644\u062f\u0648\u0644\u0629 \u0627\u0644\u062a\u064a \u062a\u0631\u063a\u0628 \u0628\u0634\u0631\u0627\u0621 \u0634\u0631\u064a\u062d\u0629 eSIM \u0644\u0647\u0627:</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            "\u064a\u0638\u0647\u0631 \u0628\u062c\u0627\u0646\u0628 \u0643\u0644 \u062f\u0648\u0644\u0629 \u0639\u062f\u062f \u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0627\u0644\u0645\u062a\u0648\u0641\u0631\u0629 \u0644\u0644\u0627\u0633\u062a\u0644\u0627\u0645 \u0627\u0644\u0641\u0648\u0631\u064a:"
+            "🌍 <b>اختر الدولة التي ترغب بشراء شريحة eSIM لها:</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "يظهر بجانب كل دولة عدد الشرائح المتوفرة للاستلام الفوري:"
         )
         await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
         return
@@ -736,13 +907,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         plans = db.get_plans_by_country(country_id)
         if not plans:
             text = (
-                f"\U0001f30d <b>\u0627\u0644\u062f\u0648\u0644\u0629: {html.escape(country['name'])}</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u26a0\ufe0f \u0644\u0627 \u062a\u0648\u062c\u062f \u0628\u0627\u0642\u0627\u062a \u0645\u0636\u0627\u0641\u0629 \u0644\u0647\u0630\u0647 \u0627\u0644\u062f\u0648\u0644\u0629 \u062d\u0627\u0644\u064a\u0627\u064b."
+                f"🌍 <b>الدولة: {html.escape(country['name'])}</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "⚠️ لا توجد باقات مضافة لهذه الدولة حالياً."
             )
             kb = InlineKeyboardMarkup([
-                [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062f\u0648\u0644", callback_data="u_countries")],
-                [IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+                [IKB("🔙 العودة لقائمة الدول", callback_data="u_countries")],
+                [IKB("🏠 القائمة الرئيسية", callback_data="home")],
             ])
             await safe_edit_or_send(update, text, kb)
             return
@@ -750,120 +921,114 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         rows = []
         for p in plans:
             avail = int(p["available_count"] or 0)
-            status_str = f"\u0645\u062a\u0627\u062d ({avail})" if avail > 0 else "\u0646\u0641\u062f\u062a \u0627\u0644\u0643\u0645\u064a\u0629"
+            status_str = f"متاح ({avail})" if avail > 0 else "نفدت الكمية"
             rows.append([
                 IKB(
-                    f"\U0001f4e6 {p['name']} | {float(p['price']):.2f} {currency} ({status_str})",
+                    f"📦 {p['name']} | {float(p['price']):.2f} {currency} ({status_str})",
                     callback_data=f"u_plan:{p['id']}",
                 )
             ])
-        rows.append([IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062f\u0648\u0644", callback_data="u_countries")])
-        rows.append([IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
+        rows.append([IKB("🔙 العودة لقائمة الدول", callback_data="u_countries")])
+        rows.append([IKB("🏠 القائمة الرئيسية", callback_data="home")])
         text = (
-            f"\U0001f30d <b>\u0628\u0627\u0642\u0627\u062a \u0634\u0631\u0627\u0626\u062d eSIM \u0644\u062f\u0648\u0644\u0629: {html.escape(country['name'])}</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            "\U0001f447 \u0627\u062e\u062a\u0631 \u0627\u0644\u0628\u0627\u0642\u0629 \u0627\u0644\u0645\u0646\u0627\u0633\u0628\u0629 \u0644\u0643 \u0644\u0639\u0631\u0636 \u0627\u0644\u062a\u0641\u0627\u0635\u064a\u0644 \u0648\u0627\u0644\u0634\u0631\u0627\u0621 \u0627\u0644\u0641\u0648\u0631\u064a:"
+            f"🌍 <b>باقات شرائح eSIM لدولة: {html.escape(country['name'])}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "👇 اختر الباقة المناسبة لك لعرض التفاصيل والشراء الفوري:"
         )
         await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
         return
 
     if data.startswith("u_plan:"):
         await q.answer()
+        parts = data.split(":")
+        plan_id = int(parts[1])
+        qty = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+        await render_user_plan_view(update, context, user, plan_id, qty=qty)
+        return
+
+    if data.startswith("u_alert_toggle:"):
         plan_id = int(data.split(":")[1])
-        plan = db.get_plan(plan_id)
-        if not plan:
-            await show_home(update, context)
+        if not db.get_plan(plan_id):
+            await q.answer("⚠️ الباقة غير موجودة.", show_alert=True)
             return
-        u_row = db.get_user(user.id)
-        avail = int(plan["available_count"] or 0)
-        balance = float(u_row["balance"]) if u_row else 0.0
-        price = float(plan["price"])
-
-        desc_block = f"\U0001f4dd <b>\u062a\u0641\u0627\u0635\u064a\u0644 \u0627\u0644\u0628\u0627\u0642\u0629:</b>\n{html.escape(plan['description'])}\n\n" if plan.get("description") else ""
-        stock_line = f"\u2705 \u0645\u062a\u0648\u0641\u0631 \u0644\u0644\u0627\u0633\u062a\u0644\u0627\u0645 \u0627\u0644\u0641\u0648\u0631\u064a ({avail} \u0634\u0631\u064a\u062d\u0629)" if avail > 0 else "\u274c \u0646\u0641\u062f\u062a \u0627\u0644\u0643\u0645\u064a\u0629 \u062d\u0627\u0644\u064a\u0627\u064b"
-
-        text = (
-            f"\U0001f4e6 <b>\u062a\u0641\u0627\u0635\u064a\u0644 \u0627\u0644\u0628\u0627\u0642\u0629 \u0627\u0644\u0645\u062e\u062a\u0627\u0631\u0629</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            f"\U0001f30d <b>\u0627\u0644\u062f\u0648\u0644\u0629:</b> {html.escape(plan['country_name'])}\n"
-            f"\U0001f3f7 <b>\u0627\u0633\u0645 \u0627\u0644\u0628\u0627\u0642\u0629:</b> {html.escape(plan['name'])}\n"
-            f"\U0001f4b5 <b>\u0633\u0639\u0631 \u0627\u0644\u0628\u0627\u0642\u0629:</b> <code>{price:.2f}</code> {html.escape(currency)}\n"
-            f"\U0001f4ca <b>\u062d\u0627\u0644\u0629 \u0627\u0644\u0645\u062e\u0632\u0648\u0646:</b> {stock_line}\n\n"
-            f"{desc_block}"
-            f"\U0001f4b0 <b>\u0631\u0635\u064a\u062f\u0643 \u0627\u0644\u062d\u0627\u0644\u064a:</b> <code>{balance:.2f}</code> {html.escape(currency)}"
+        subscribed = db.toggle_stock_alert(user.id, plan_id)
+        await q.answer(
+            "🔔 تم تفعيل التنبيه! سنرسل لك إشعاراً فور توفر الباقة." if subscribed else "🔕 تم إلغاء تنبيه توفر هذه الباقة.",
+            show_alert=subscribed,
         )
-        rows = []
-        if avail > 0:
-            if balance >= price:
-                rows.append([
-                    IKB(
-                        f"\u2705 \u062a\u0623\u0643\u064a\u062f \u0627\u0644\u0634\u0631\u0627\u0621 ({price:.2f} {currency})",
-                        callback_data=f"u_buy_confirm:{plan_id}",
-                    )
-                ])
-            else:
-                diff = round(price - balance, 2)
-                text += f"\n\n\u26a0\ufe0f <b>\u0631\u0635\u064a\u062f\u0643 \u063a\u064a\u0631 \u0643\u0627\u0641\u064d \u0644\u0625\u062a\u0645\u0627\u0645 \u0627\u0644\u0634\u0631\u0627\u0621. \u062a\u062d\u062a\u0627\u062c \u0625\u0644\u0649 \u0634\u062d\u0646 <code>{diff:.2f}</code> {html.escape(currency)} \u0625\u0636\u0627\u0641\u064a\u0629.</b>"
-                rows.append([IKB("\U0001f4b3 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0627\u0644\u0622\u0646", callback_data="u_topup")])
-        rows.append([IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0628\u0627\u0642\u0627\u062a \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"u_country:{plan['country_id']}")])
-        rows.append([IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
-        await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
+        await render_user_plan_view(update, context, user, plan_id, qty=1)
         return
 
     if data.startswith("u_buy_confirm:"):
-        plan_id = int(data.split(":")[1])
-        ok, code, result = db.purchase_esim_atomic(user.id, plan_id)
+        parts = data.split(":")
+        plan_id = int(parts[1])
+        qty = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+        plan = db.get_plan(plan_id)
+        if not plan:
+            await q.answer("⚠️ الباقة غير موجودة.", show_alert=True)
+            return
+        qty = max(1, min(qty, min(int(plan.get("available_count") or 0), 10)))
+        ok, code, result = db.purchase_esims_atomic(user.id, plan_id, quantity=qty)
         if not ok:
             if code == "insufficient_balance":
-                await q.answer("\u26a0\ufe0f \u0631\u0635\u064a\u062f\u0643 \u063a\u064a\u0631 \u0643\u0627\u0641\u064d \u0644\u0625\u062a\u0645\u0627\u0645 \u0639\u0645\u0644\u064a\u0629 \u0627\u0644\u0634\u0631\u0627\u0621!", show_alert=True)
+                await q.answer("⚠️ رصيدك غير كافٍ لإتمام عملية الشراء!", show_alert=True)
+                await render_user_plan_view(update, context, user, plan_id, qty=qty)
             elif code == "out_of_stock":
-                await q.answer("\u26a0\ufe0f \u0639\u0630\u0631\u0627\u064b\u060c \u0646\u0641\u062f\u062a \u0643\u0645\u064a\u0629 \u0647\u0630\u0647 \u0627\u0644\u0628\u0627\u0642\u0629 \u0644\u0644\u062a\u0648!", show_alert=True)
+                available = int((result or {}).get("available") or 0)
+                await q.answer("⚠️ تغير المخزون، تم تحديث الكمية المتاحة.", show_alert=True)
+                await render_user_plan_view(update, context, user, plan_id, qty=max(1, available))
             else:
-                await q.answer("\u26a0\ufe0f \u062a\u0639\u0630\u0631 \u0625\u062a\u0645\u0627\u0645 \u0627\u0644\u0634\u0631\u0627\u0621\u060c \u062d\u0627\u0648\u0644 \u0645\u0631\u0629 \u0623\u062e\u0631\u0649.", show_alert=True)
+                await q.answer("⚠️ تعذر إتمام الشراء، حاول مرة أخرى.", show_alert=True)
             return
-
-        await q.answer("\U0001f389 \u062a\u0645\u062a \u0639\u0645\u0644\u064a\u0629 \u0627\u0644\u0634\u0631\u0627\u0621 \u0628\u0646\u062c\u0627\u062d!")
-        # Deliver QR & LPA to buyer
-        await deliver_esim_to_chat(
-            context=context,
-            chat_id=user.id,
-            esim=result,
-            header_title="\U0001f389 <b>\u062a\u0645 \u0634\u0631\u0627\u0621 \u0634\u0631\u064a\u062d\u0629 eSIM \u0628\u0646\u062c\u0627\u062d!</b>",
-        )
-        # Notify Admin of sale (identifies exactly which QR code / eSIM was sold)
-        await send_admin_sale_alert(context=context, buyer=user, esim=result)
+        items = result.get("items") or [result]
+        total = len(items)
+        await q.answer(f"🎉 تم شراء {total} شرائح بنجاح!" if total > 1 else "🎉 تمت عملية الشراء بنجاح!")
+        for idx, item in enumerate(items, 1):
+            header = (
+                f"🎉 <b>تم شراء شريحة eSIM بنجاح! (شريحة {idx} من {total})</b>"
+                if total > 1 else "🎉 <b>تم شراء شريحة eSIM بنجاح!</b>"
+            )
+            await deliver_esim_to_chat(context, user.id, item, header_title=header)
+        await send_admin_sale_alert(context, user, result)
         return
 
-    # ---------------- USER: MY PURCHASES ----------------
-    if data == "u_purchases":
+    if data == "u_purchases" or data.startswith("u_purchases:"):
         await q.answer()
+        page = int(data.split(":")[1]) if ":" in data and data.split(":")[1].isdigit() else 0
         purchases = db.get_user_purchases(user.id)
         if not purchases:
             text = (
-                "\U0001f4e6 <b>\u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a \u0627\u0644\u0633\u0627\u0628\u0642\u0629</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u0644\u0645 \u062a\u0642\u0645 \u0628\u0634\u0631\u0627\u0621 \u0623\u064a \u0634\u0631\u064a\u062d\u0629 eSIM \u062d\u062a\u0649 \u0627\u0644\u0622\u0646."
+                "📦 <b>مشترياتي السابقة</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                "لم تقم بشراء أي شريحة eSIM حتى الآن."
             )
             kb = InlineKeyboardMarkup([
-                [IKB("\U0001f6d2 \u062a\u0635\u0641\u062d \u0627\u0644\u062f\u0648\u0644 \u0648\u0627\u0644\u0628\u0627\u0642\u0627\u062a", callback_data="u_countries")],
-                [IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+                [IKB("🛒 تصفح الدول والباقات", callback_data="u_countries")],
+                [IKB("🏠 القائمة الرئيسية", callback_data="home")],
             ])
             await safe_edit_or_send(update, text, kb)
             return
-
+        per_page = 12
+        total_pages = max(1, (len(purchases) + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
         rows = []
-        for item in purchases[:20]:
-            rows.append([
-                IKB(
-                    f"\U0001f4f2 #{item['id']} | {item['country_name']} - {item['plan_name']} ({float(item['sold_price'] or 0):.2f} {currency})",
-                    callback_data=f"u_view_esim:{item['id']}",
-                )
-            ])
-        rows.append([IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
+        for item in purchases[page * per_page:(page + 1) * per_page]:
+            rows.append([IKB(
+                f"📲 #{item['id']} | {item['country_name']} - {item['plan_name']} ({float(item['sold_price'] or 0):.2f} {currency})",
+                callback_data=f"u_view_esim:{item['id']}",
+            )])
+        if total_pages > 1:
+            nav = []
+            if page > 0:
+                nav.append(IKB("⬅️ السابق", callback_data=f"u_purchases:{page - 1}"))
+            nav.append(IKB(f"📄 {page + 1} / {total_pages}", callback_data=f"u_purchases:{page}"))
+            if page + 1 < total_pages:
+                nav.append(IKB("التالي ➡️", callback_data=f"u_purchases:{page + 1}"))
+            rows.append(nav)
+        rows.append([IKB("🏠 القائمة الرئيسية", callback_data="home")])
         text = (
-            "\U0001f4e6 <b>\u0633\u062c\u0644 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u064a \u0645\u0646 \u0634\u0631\u0627\u0626\u062d eSIM</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            "\U0001f447 \u0627\u0636\u063a\u0637 \u0639\u0644\u0649 \u0623\u064a \u0634\u0631\u064a\u062d\u0629 \u0644\u0625\u0639\u0627\u062f\u0629 \u0639\u0631\u0636 \u0643\u0648\u062f \u0627\u0644\u0640 QR \u0648\u0643\u0648\u062f \u0627\u0644\u062a\u0641\u0639\u064a\u0644 \u0627\u0644\u062e\u0627\u0635 \u0628\u0647\u0627:"
+            f"📦 <b>سجل مشترياتي من شرائح eSIM (الإجمالي: {len(purchases)})</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "👇 اضغط على أي شريحة لإعادة عرض بياناتها:"
         )
         await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
         return
@@ -872,14 +1037,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         esim_id = int(data.split(":")[1])
         esim = db.get_esim(esim_id)
         if not esim or esim.get("sold_to") != user.id:
-            await q.answer("\u26a0\ufe0f \u062a\u0639\u0630\u0631 \u0627\u0644\u0639\u062b\u0648\u0631 \u0639\u0644\u0649 \u0647\u0630\u0647 \u0627\u0644\u0634\u0631\u064a\u062d\u0629.", show_alert=True)
+            await q.answer("⚠️ تعذر العثور على هذه الشريحة.", show_alert=True)
             return
-        await q.answer("\U0001f4f2 \u062c\u0627\u0631\u064a \u0625\u0631\u0633\u0627\u0644 \u0628\u064a\u0627\u0646\u0627\u062a \u0627\u0644\u0634\u0631\u064a\u062d\u0629...")
+        await q.answer("📲 جاري إرسال بيانات الشريحة...")
         await deliver_esim_to_chat(
             context=context,
             chat_id=user.id,
             esim=esim,
-            header_title=f"\U0001f4e6 <b>\u0628\u064a\u0627\u0646\u0627\u062a \u0634\u0631\u064a\u062d\u062a\u0643 \u0627\u0644\u0645\u0634\u062a\u0631\u0627\u0629 (#{esim['id']})</b>",
+            header_title=f"📦 <b>بيانات شريحتك المشتراة (#{esim['id']})</b>",
         )
         return
 
@@ -889,24 +1054,24 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         clear_state(context)
         purchases = db.get_user_purchases(user.id)
         my_requests = db.get_user_refunds(user.id)
-        status_labels = {"pending": "\u23f3 \u0642\u064a\u062f \u0627\u0644\u0645\u0631\u0627\u062c\u0639\u0629", "reviewed": "\u2705 \u062a\u0645\u062a \u0627\u0644\u0645\u0631\u0627\u062c\u0639\u0629"}
+        status_labels = {"pending": "⏳ قيد المراجعة", "reviewed": "✅ تمت المراجعة"}
         requests_lines = ""
         if my_requests:
-            requests_lines = "\n\U0001f4cb <b>\u0637\u0644\u0628\u0627\u062a\u0643 \u0627\u0644\u0633\u0627\u0628\u0642\u0629:</b>\n" + "\n".join(
-                f"\u2022 \u0637\u0644\u0628 #{r['id']} | \u0634\u0631\u064a\u062d\u0629 #{r['esim_id']} ({html.escape(r['country_name'])} - {html.escape(r['plan_name'])}) \u2014 {status_labels.get(r['status'], r['status'])}"
+            requests_lines = "\n📋 <b>طلباتك السابقة:</b>\n" + "\n".join(
+                f"• طلب #{r['id']} | شريحة #{r['esim_id']} ({html.escape(r['country_name'])} - {html.escape(r['plan_name'])}) — {status_labels.get(r['status'], r['status'])}"
                 for r in my_requests[:10]
             ) + "\n"
 
         if not purchases:
             text = (
-                "\u21a9\ufe0f <b>\u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u0644\u0645 \u062a\u0642\u0645 \u0628\u0623\u064a \u0639\u0645\u0644\u064a\u0629 \u0634\u0631\u0627\u0621 \u062d\u062a\u0649 \u0627\u0644\u0622\u0646."
+                "↩️ <b>طلب استرداد</b>\n"
+                "━━━━━━━━━━━━━━━━━━━\n"
+                "لم تقم بأي عملية شراء حتى الآن."
                 + requests_lines
             )
             kb = InlineKeyboardMarkup([
-                [IKB("\U0001f6d2 \u062a\u0635\u0641\u062d \u0627\u0644\u062f\u0648\u0644 \u0648\u0627\u0644\u0628\u0627\u0642\u0627\u062a", callback_data="u_countries")],
-                [IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+                [IKB("🛒 تصفح الدول والباقات", callback_data="u_countries")],
+                [IKB("🏠 القائمة الرئيسية", callback_data="home")],
             ])
             await safe_edit_or_send(update, text, kb)
             return
@@ -915,16 +1080,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         for item in purchases[:20]:
             rows.append([
                 IKB(
-                    f"\U0001f4f2 #{item['id']} | {item['country_name']} - {item['plan_name']} ({float(item['sold_price'] or 0):.2f} {currency})",
+                    f"📲 #{item['id']} | {item['country_name']} - {item['plan_name']} ({float(item['sold_price'] or 0):.2f} {currency})",
                     callback_data=f"u_refund_esim:{item['id']}",
                 )
             ])
-        rows.append([IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")])
+        rows.append([IKB("🏠 القائمة الرئيسية", callback_data="home")])
         text = (
-            "\u21a9\ufe0f <b>\u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            "\u0627\u062e\u062a\u0631 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0627\u0644\u062a\u064a \u062a\u0648\u062c\u062f \u0628\u0647\u0627 \u0645\u0634\u0643\u0644\u0629 \u0644\u0625\u0631\u0633\u0627\u0644 \u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f \u0644\u0644\u0625\u062f\u0627\u0631\u0629:\n\n"
-            "\u26a0\ufe0f <b>\u0645\u0644\u0627\u062d\u0638\u0629:</b> \u0633\u064a\u064f\u0637\u0644\u0628 \u0645\u0646\u0643 \u0625\u0631\u0633\u0627\u0644 <b>\u0641\u064a\u062f\u064a\u0648 \u0625\u062b\u0628\u0627\u062a</b> \u064a\u0648\u0636\u062d \u0643\u0627\u0641\u0629 \u062a\u0641\u0627\u0635\u064a\u0644 \u0627\u0644\u0645\u0634\u0643\u0644\u0629\u060c \u0648\u0633\u064a\u062a\u0645 \u0645\u0631\u0627\u062c\u0639\u0629 \u0637\u0644\u0628\u0643 \u0645\u0646 \u0627\u0644\u0625\u062f\u0627\u0631\u0629."
+            "↩️ <b>طلب استرداد</b>\n"
+            "━━━━━━━━━━━━━━━━━━━\n"
+            "اختر الشريحة التي توجد بها مشكلة لإرسال طلب استرداد للإدارة:\n\n"
+            "⚠️ <b>ملاحظة:</b> سيُطلب منك إرسال <b>فيديو إثبات</b> يوضح كافة تفاصيل المشكلة، وسيتم مراجعة طلبك من الإدارة."
             + requests_lines
         )
         await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
@@ -934,39 +1099,88 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         esim_id = int(data.split(":")[1])
         esim = db.get_esim(esim_id)
         if not esim or esim.get("sold_to") != user.id:
-            await q.answer("\u26a0\ufe0f \u062a\u0639\u0630\u0631 \u0627\u0644\u0639\u062b\u0648\u0631 \u0639\u0644\u0649 \u0647\u0630\u0647 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0636\u0645\u0646 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u0643.", show_alert=True)
+            await q.answer("⚠️ تعذر العثور على هذه الشريحة ضمن مشترياتك.", show_alert=True)
             return
         await q.answer()
         context.user_data["state"] = "USER_REFUND_REASON"
         context.user_data["temp"] = {"esim_id": esim_id}
         text = (
-            f"\u21a9\ufe0f <b>\u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f \u0644\u0644\u0634\u0631\u064a\u062d\u0629 #{esim_id}</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            f"\U0001f30d <b>\u0627\u0644\u062f\u0648\u0644\u0629:</b> {html.escape(esim['country_name'])}\n"
-            f"\U0001f4e6 <b>\u0627\u0644\u0628\u0627\u0642\u0629:</b> {html.escape(esim['plan_name'])}\n"
-            f"\U0001f4b5 <b>\u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0645\u062f\u0641\u0648\u0639:</b> <code>{float(esim['sold_price'] or 0):.2f}</code> {html.escape(currency)}\n\n"
-            "1\ufe0f\u20e3 <b>\u0627\u0644\u062e\u0637\u0648\u0629 \u0627\u0644\u0623\u0648\u0644\u0649:</b> \u0627\u0643\u062a\u0628 \u0627\u0644\u0622\u0646 <b>\u0648\u0635\u0641\u0627\u064b \u0645\u062e\u062a\u0635\u0631\u0627\u064b \u0644\u0644\u0645\u0634\u0643\u0644\u0629</b> \u0641\u064a \u0631\u0633\u0627\u0644\u0629 \u0646\u0635\u064a\u0629 "
-            "(\u0645\u062b\u0627\u0644: <code>\u0643\u0648\u062f QR \u0644\u0627 \u064a\u0639\u0645\u0644</code> \u0623\u0648 <code>\u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0645\u0641\u0639\u0644\u0629 \u0645\u0633\u0628\u0642\u0627\u064b</code>):"
+            f"↩️ <b>طلب استرداد للشريحة #{esim_id}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━\n"
+            f"🌍 <b>الدولة:</b> {html.escape(esim['country_name'])}\n"
+            f"📦 <b>الباقة:</b> {html.escape(esim['plan_name'])}\n"
+            f"💵 <b>السعر المدفوع:</b> <code>{float(esim['sold_price'] or 0):.2f}</code> {html.escape(currency)}\n\n"
+            "1️⃣ <b>الخطوة الأولى:</b> اكتب الآن <b>وصفاً مختصراً للمشكلة</b> في رسالة نصية "
+            "(مثال: <code>كود QR لا يعمل</code> أو <code>الشريحة مفعلة مسبقاً</code>):"
         )
-        kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621 \u0627\u0644\u0637\u0644\u0628", callback_data="u_refund")]])
+        kb = InlineKeyboardMarkup([[IKB("🔙 إلغاء الطلب", callback_data="u_refund")]])
         await safe_edit_or_send(update, text, kb)
         return
 
     # ---------------- USER: TOP-UP FLOW ----------------
+    if data == "u_topup_history" or data.startswith("u_topup_history:"):
+        await q.answer()
+        clear_state(context)
+        page = int(data.split(":")[1]) if ":" in data and data.split(":")[1].isdigit() else 0
+        reqs = db.get_user_topups(user.id)
+        if not reqs:
+            text = "📜 <b>سجل طلبات شحن الرصيد</b>\n━━━━━━━━━━━━━━━━━━━━\nلا توجد لديك طلبات شحن سابقة."
+            kb = InlineKeyboardMarkup([
+                [IKB("💳 شحن الرصيد الآن", callback_data="u_topup")],
+                [IKB("🏠 القائمة الرئيسية", callback_data="home")],
+            ])
+            await safe_edit_or_send(update, text, kb)
+            return
+        approved = [r for r in reqs if r["status"] == "approved"]
+        pending = sum(1 for r in reqs if r["status"] == "pending")
+        rejected = sum(1 for r in reqs if r["status"] == "rejected")
+        total_approved = sum(float(r.get("amount") or 0) for r in approved)
+        per_page = 10
+        pages = max(1, (len(reqs) + per_page - 1) // per_page)
+        page = max(0, min(page, pages - 1))
+        labels = {"pending": "⏳ قيد المراجعة", "approved": "✅ مقبول", "rejected": "❌ مرفوض"}
+        lines = []
+        for r in reqs[page * per_page:(page + 1) * per_page]:
+            method = "Binance Pay" if r["method"] == "binance" else "InstaPay EG"
+            lines.append(
+                f"• <b>#{r['id']}</b> | <code>{float(r['amount']):.2f}</code> {html.escape(currency)} | "
+                f"{method} — {labels.get(r['status'], r['status'])} <i>({str(r.get('created_at') or '')[:16]})</i>"
+            )
+        text = (
+            f"📜 <b>سجل طلبات شحن الرصيد ({len(reqs)})</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ مقبولة: {len(approved)} (<code>{total_approved:.2f}</code> {html.escape(currency)}) | "
+            f"⏳ معلقة: {pending} | ❌ مرفوضة: {rejected}\n━━━━━━━━━━━━━━━━━━━━\n"
+            + "\n".join(lines)
+        )
+        rows = []
+        if pages > 1:
+            nav = []
+            if page > 0:
+                nav.append(IKB("⬅️ السابق", callback_data=f"u_topup_history:{page - 1}"))
+            nav.append(IKB(f"📄 {page + 1} / {pages}", callback_data=f"u_topup_history:{page}"))
+            if page + 1 < pages:
+                nav.append(IKB("التالي ➡️", callback_data=f"u_topup_history:{page + 1}"))
+            rows.append(nav)
+        rows.append([IKB("💳 طلب شحن جديد", callback_data="u_topup"), IKB("💰 حسابي", callback_data="u_account")])
+        rows.append([IKB("🏠 القائمة الرئيسية", callback_data="home")])
+        await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
+        return
+
     if data == "u_topup":
         await q.answer()
         clear_state(context)
         text = (
-            "\U0001f4b3 <b>\u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0641\u064a \u0627\u0644\u0628\u0648\u062a</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            "\u0627\u062e\u062a\u0631 \u0648\u0633\u064a\u0644\u0629 \u0627\u0644\u062f\u0641\u0639 \u0627\u0644\u0645\u0646\u0627\u0633\u0628\u0629 \u0644\u0643 \u0644\u0634\u062d\u0646 \u0631\u0635\u064a\u062f\u0643:\n\n"
-            "\U0001f7e1 <b>Binance Pay (\u0639\u0645\u0644\u0627\u062a \u0631\u0642\u0645\u064a\u0629 - USDT)</b>\n"
-            "\U0001f7e3 <b>InstaPay EG (\u0625\u0646\u0633\u062a\u0627 \u0628\u0627\u064a \u0645\u0635\u0631)</b>"
+            "💳 <b>شحن الرصيد في البوت</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "اختر وسيلة الدفع المناسبة لك لشحن رصيدك:\n\n"
+            "🟡 <b>Binance Pay (عملات رقمية - USDT)</b>\n"
+            "🟣 <b>InstaPay EG (إنستا باي مصر)</b>"
         )
         kb = InlineKeyboardMarkup([
-            [IKB("\U0001f7e1 \u0627\u0644\u062f\u0641\u0639 \u0639\u0628\u0631 Binance ID (\u0639\u0645\u0644\u0627\u062a \u0631\u0642\u0645\u064a\u0629)", callback_data="u_topup_m:binance")],
-            [IKB("\U0001f7e3 \u0627\u0644\u062f\u0641\u0639 \u0639\u0628\u0631 InstaPay EG (\u0625\u0646\u0633\u062a\u0627 \u0628\u0627\u064a)", callback_data="u_topup_m:instapay")],
-            [IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+            [IKB("🟡 الدفع عبر Binance ID (عملات رقمية)", callback_data="u_topup_m:binance")],
+            [IKB("🟣 الدفع عبر InstaPay EG (إنستا باي)", callback_data="u_topup_m:instapay")],
+            [IKB("📜 سجل طلبات الشحن السابقة", callback_data="u_topup_history:0")],
+            [IKB("🏠 القائمة الرئيسية", callback_data="home")],
         ])
         await safe_edit_or_send(update, text, kb)
         return
@@ -978,26 +1192,26 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data["temp"] = {"method": method}
 
         if method == "binance":
-            pay_target = db.get_setting("binance_id", "\u063a\u064a\u0631 \u0645\u062d\u062f\u062f")
-            method_title = "\U0001f7e1 Binance Pay (\u0639\u0645\u0644\u0627\u062a \u0631\u0642\u0645\u064a\u0629)"
-            target_label = "\u0645\u0639\u0631\u0641 Binance ID \u0644\u0644\u062a\u062d\u0648\u064a\u0644"
+            pay_target = db.get_setting("binance_id", "غير محدد")
+            method_title = "🟡 Binance Pay (عملات رقمية)"
+            target_label = "معرف Binance ID للتحويل"
         else:
-            pay_target = db.get_setting("instapay_address", "\u063a\u064a\u0631 \u0645\u062d\u062f\u062f")
-            method_title = "\U0001f7e3 InstaPay EG (\u0625\u0646\u0633\u062a\u0627 \u0628\u0627\u064a \u0645\u0635\u0631)"
-            target_label = "\u0639\u0646\u0648\u0627\u0646 \u0627\u0644\u062f\u0641\u0639 / \u0631\u0642\u0645 InstaPay EG"
+            pay_target = db.get_setting("instapay_address", "غير محدد")
+            method_title = "🟣 InstaPay EG (إنستا باي مصر)"
+            target_label = "عنوان الدفع / رقم InstaPay EG"
 
         text = (
-            f"\U0001f4b3 <b>\u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0639\u0628\u0631 {method_title}</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            f"\U0001f4cc <b>{target_label}:</b>\n"
+            f"💳 <b>شحن الرصيد عبر {method_title}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>{target_label}:</b>\n"
             f"<code>{html.escape(pay_target)}</code>\n"
-            "<i>(\u0627\u0636\u063a\u0637 \u0639\u0644\u0649 \u0627\u0644\u0643\u0648\u062f \u0623\u0639\u0644\u0627\u0647 \u0644\u0646\u0633\u062e\u0647)</i>\n\n"
-            "1\ufe0f\u20e3 \u0642\u0645 \u0628\u062a\u062d\u0648\u064a\u0644 \u0627\u0644\u0645\u0628\u0644\u063a \u0627\u0644\u0645\u0637\u0644\u0648\u0628 \u0625\u0644\u0649 \u0627\u0644\u062d\u0633\u0627\u0628 \u0627\u0644\u0645\u0648\u0636\u062d \u0623\u0639\u0644\u0627\u0647.\n"
-            f"2\ufe0f\u20e3 \u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0642\u064a\u0645\u0629 \u0627\u0644\u0645\u0628\u0644\u063a \u0627\u0644\u0645\u0631\u0627\u062f \u0634\u062d\u0646\u0647 ({html.escape(currency)})</b> \u0641\u064a \u0631\u0633\u0627\u0644\u0629 \u0646\u0635\u064a\u0629 \u0628\u0627\u0644\u0623\u0633\u0641\u0644 (\u0645\u062b\u0627\u0644: <code>10</code> \u0623\u0648 <code>25.5</code>):"
+            "<i>(اضغط على الكود أعلاه لنسخه)</i>\n\n"
+            "1️⃣ قم بتحويل المبلغ المطلوب إلى الحساب الموضح أعلاه.\n"
+            f"2️⃣ أرسل الآن <b>قيمة المبلغ المراد شحنه ({html.escape(currency)})</b> في رسالة نصية بالأسفل (مثال: <code>10</code> أو <code>25.5</code>):"
         )
         kb = InlineKeyboardMarkup([
-            [IKB("\U0001f519 \u062a\u063a\u064a\u064a\u0631 \u0648\u0633\u064a\u0644\u0629 \u0627\u0644\u062f\u0641\u0639", callback_data="u_topup")],
-            [IKB("\U0001f3e0 \u0625\u0644\u063a\u0627\u0621 \u0648\u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")],
+            [IKB("🔙 تغيير وسيلة الدفع", callback_data="u_topup")],
+            [IKB("🏠 إلغاء والعودة للرئيسية", callback_data="home")],
         ])
         await safe_edit_or_send(update, text, kb)
         return
@@ -1007,7 +1221,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # ==========================================================================
     if data.startswith("adm_"):
         if not is_admin(user.id):
-            await q.answer("\u26d4 \u063a\u064a\u0631 \u0645\u0635\u0631\u062d \u0644\u0643 \u0628\u0627\u0644\u062f\u062e\u0648\u0644!", show_alert=True)
+            await q.answer("⛔ غير مصرح لك بالدخول!", show_alert=True)
             return
 
         if data == "adm_home":
@@ -1020,19 +1234,19 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.answer()
             clear_state(context)
             countries = db.get_countries()
-            rows = [[IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u062f\u0648\u0644\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data="adm_country_add")]]
+            rows = [[IKB("➕ إضافة دولة جديدة", callback_data="adm_country_add")]]
             for c in countries:
                 rows.append([
                     IKB(
-                        f"\U0001f30d {c['name']} (\u0627\u0644\u0628\u0627\u0642\u0627\u062a: {c['plans_count']} | \u0627\u0644\u0645\u062e\u0632\u0648\u0646: {int(c['available_stock'] or 0)})",
+                        f"🌍 {c['name']} (الباقات: {c['plans_count']} | المخزون: {int(c['available_stock'] or 0)})",
                         callback_data=f"adm_country_view:{c['id']}",
                     )
                 ])
-            rows.append([IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
+            rows.append([IKB("🔙 لوحة تحكم الأدمن", callback_data="adm_home")])
             text = (
-                "\U0001f30d <b>\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u062f\u0648\u0644</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u064a\u0645\u0643\u0646\u0643 \u0625\u0636\u0627\u0641\u0629 \u062f\u0648\u0644\u0629 \u062c\u062f\u064a\u062f\u0629 \u0623\u0648 \u0627\u0644\u0636\u063a\u0637 \u0639\u0644\u0649 \u0623\u064a \u062f\u0648\u0644\u0629 \u0644\u062a\u0639\u062f\u064a\u0644\u0647\u0627 \u0623\u0648 \u062d\u0630\u0641\u0647\u0627 \u0623\u0648 \u0625\u062f\u0627\u0631\u0629 \u0628\u0627\u0642\u0627\u062a\u0647\u0627:"
+                "🌍 <b>إدارة الدول</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "يمكنك إضافة دولة جديدة أو الضغط على أي دولة لتعديلها أو حذفها أو إدارة باقاتها:"
             )
             await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
             return
@@ -1041,11 +1255,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.answer()
             context.user_data["state"] = "ADM_ADD_COUNTRY"
             text = (
-                "\u2795 <b>\u0625\u0636\u0627\u0641\u0629 \u062f\u0648\u0644\u0629 \u062c\u062f\u064a\u062f\u0629</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 \u0627\u0633\u0645 \u0627\u0644\u062f\u0648\u0644\u0629 \u0645\u0639 \u0627\u0644\u0639\u0644\u0645 (\u0645\u062b\u0627\u0644: <code>\U0001f1f9\U0001f1f7 \u062a\u0631\u0643\u064a\u0627</code> \u0623\u0648 <code>\U0001f1f8\U0001f1e6 \u0627\u0644\u0633\u0639\u0648\u062f\u064a\u0629</code>):"
+                "➕ <b>إضافة دولة جديدة</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "أرسل الآن اسم الدولة مع العلم (مثال: <code>🇹🇷 تركيا</code> أو <code>🇸🇦 السعودية</code>):"
             )
-            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_countries")]])
+            kb = InlineKeyboardMarkup([[IKB("🔙 إلغاء", callback_data="adm_countries")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1059,16 +1273,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
             plans = db.get_plans_by_country(country_id)
             text = (
-                f"\U0001f30d <b>\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u062f\u0648\u0644\u0629: {html.escape(country['name'])}</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                f"\U0001f4e6 <b>\u0639\u062f\u062f \u0627\u0644\u0628\u0627\u0642\u0627\u062a \u0627\u0644\u0645\u0636\u0627\u0641\u0629:</b> {len(plans)} \u0628\u0627\u0642\u0629\n\n"
-                "\u0627\u062e\u062a\u0631 \u0627\u0644\u0625\u062c\u0631\u0627\u0621 \u0627\u0644\u0645\u0637\u0644\u0648\u0628:"
+                f"🌍 <b>إدارة الدولة: {html.escape(country['name'])}</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"📦 <b>عدد الباقات المضافة:</b> {len(plans)} باقة\n\n"
+                "اختر الإجراء المطلوب:"
             )
             kb = InlineKeyboardMarkup([
-                [IKB("\U0001f4e6 \u0625\u062f\u0627\u0631\u0629 \u0628\u0627\u0642\u0627\u062a \u0647\u0630\u0647 \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plans_country:{country_id}")],
-                [IKB("\u270f\ufe0f \u062a\u0639\u062f\u064a\u0644 \u0627\u0633\u0645 \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_country_edit:{country_id}")],
-                [IKB("\U0001f5d1\ufe0f \u062d\u0630\u0641 \u0627\u0644\u062f\u0648\u0644\u0629 \u0628\u0627\u0644\u0643\u0627\u0645\u0644", callback_data=f"adm_country_del:{country_id}")],
-                [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062f\u0648\u0644", callback_data="adm_countries")],
+                [IKB("📦 إدارة باقات هذه الدولة", callback_data=f"adm_plans_country:{country_id}")],
+                [IKB("✏️ تعديل اسم الدولة", callback_data=f"adm_country_edit:{country_id}")],
+                [IKB("🗑️ حذف الدولة بالكامل", callback_data=f"adm_country_del:{country_id}")],
+                [IKB("🔙 العودة لقائمة الدول", callback_data="adm_countries")],
             ])
             await safe_edit_or_send(update, text, kb)
             return
@@ -1082,30 +1296,30 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data["state"] = "ADM_EDIT_COUNTRY"
             context.user_data["temp"] = {"country_id": country_id}
             text = (
-                f"\u270f\ufe0f <b>\u062a\u0639\u062f\u064a\u0644 \u0627\u0633\u0645 \u0627\u0644\u062f\u0648\u0644\u0629: {html.escape(country['name'])}</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u0623\u0631\u0633\u0644 \u0627\u0644\u0627\u0633\u0645 \u0627\u0644\u062c\u062f\u064a\u062f \u0644\u0644\u062f\u0648\u0644\u0629 \u0627\u0644\u0622\u0646:"
+                f"✏️ <b>تعديل اسم الدولة: {html.escape(country['name'])}</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "أرسل الاسم الجديد للدولة الآن:"
             )
-            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data=f"adm_country_view:{country_id}")]])
+            kb = InlineKeyboardMarkup([[IKB("🔙 إلغاء", callback_data=f"adm_country_view:{country_id}")]])
             await safe_edit_or_send(update, text, kb)
             return
 
         if data.startswith("adm_country_del:"):
             country_id = int(data.split(":")[1])
             db.delete_country(country_id)
-            await q.answer("\U0001f5d1\ufe0f \u062a\u0645 \u062d\u0630\u0641 \u0627\u0644\u062f\u0648\u0644\u0629 \u0648\u0628\u0627\u0642\u0627\u062a\u0647\u0627 \u0628\u0646\u062c\u0627\u062d!", show_alert=True)
+            await q.answer("🗑️ تم حذف الدولة وباقاتها بنجاح!", show_alert=True)
             # Return to countries list
             countries = db.get_countries()
-            rows = [[IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u062f\u0648\u0644\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data="adm_country_add")]]
+            rows = [[IKB("➕ إضافة دولة جديدة", callback_data="adm_country_add")]]
             for c in countries:
                 rows.append([
                     IKB(
-                        f"\U0001f30d {c['name']} (\u0627\u0644\u0628\u0627\u0642\u0627\u062a: {c['plans_count']} | \u0627\u0644\u0645\u062e\u0632\u0648\u0646: {int(c['available_stock'] or 0)})",
+                        f"🌍 {c['name']} (الباقات: {c['plans_count']} | المخزون: {int(c['available_stock'] or 0)})",
                         callback_data=f"adm_country_view:{c['id']}",
                     )
                 ])
-            rows.append([IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
-            await safe_edit_or_send(update, "\u2705 <b>\u062a\u0645 \u062d\u0630\u0641 \u0627\u0644\u062f\u0648\u0644\u0629 \u0628\u0646\u062c\u0627\u062d.</b>\n\n\U0001f30d <b>\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u062f\u0648\u0644:</b>", InlineKeyboardMarkup(rows))
+            rows.append([IKB("🔙 لوحة تحكم الأدمن", callback_data="adm_home")])
+            await safe_edit_or_send(update, "✅ <b>تم حذف الدولة بنجاح.</b>\n\n🌍 <b>إدارة الدول:</b>", InlineKeyboardMarkup(rows))
             return
 
         # ---------------- ADMIN: PLANS ----------------
@@ -1116,21 +1330,21 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if not countries:
                 await safe_edit_or_send(
                     update,
-                    "\u26a0\ufe0f <b>\u0644\u0627 \u062a\u0648\u062c\u062f \u062f\u0648\u0644 \u0645\u0636\u0627\u0641\u0629 \u0628\u0639\u062f. \u0642\u0645 \u0628\u0625\u0636\u0627\u0641\u0629 \u062f\u0648\u0644\u0629 \u0623\u0648\u0644\u0627\u064b \u062b\u0645 \u0623\u0636\u0641 \u0628\u0627\u0642\u0627\u062a\u0647\u0627.</b>",
+                    "⚠️ <b>لا توجد دول مضافة بعد. قم بإضافة دولة أولاً ثم أضف باقاتها.</b>",
                     InlineKeyboardMarkup([
-                        [IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u062f\u0648\u0644\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data="adm_country_add")],
-                        [IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")],
+                        [IKB("➕ إضافة دولة جديدة", callback_data="adm_country_add")],
+                        [IKB("🔙 لوحة تحكم الأدمن", callback_data="adm_home")],
                     ]),
                 )
                 return
             rows = [
-                [IKB(f"\U0001f30d {c['name']} ({c['plans_count']} \u0628\u0627\u0642\u0629)", callback_data=f"adm_plans_country:{c['id']}")]
+                [IKB(f"🌍 {c['name']} ({c['plans_count']} باقة)", callback_data=f"adm_plans_country:{c['id']}")]
                 for c in countries
             ]
-            rows.append([IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
+            rows.append([IKB("🔙 لوحة تحكم الأدمن", callback_data="adm_home")])
             await safe_edit_or_send(
                 update,
-                "\U0001f4e6 <b>\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0628\u0627\u0642\u0627\u062a</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u0627\u062e\u062a\u0631 \u0627\u0644\u062f\u0648\u0644\u0629 \u0644\u0625\u062f\u0627\u0631\u0629 \u0628\u0627\u0642\u0627\u062a\u0647\u0627:",
+                "📦 <b>إدارة الباقات</b>\n━━━━━━━━━━━━━━━━━━━━\nاختر الدولة لإدارة باقاتها:",
                 InlineKeyboardMarkup(rows),
             )
             return
@@ -1143,20 +1357,20 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if not country:
                 return
             plans = db.get_plans_by_country(country_id)
-            rows = [[IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0628\u0627\u0642\u0629 \u062c\u062f\u064a\u062f\u0629 \u0644\u0647\u0630\u0647 \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plan_add:{country_id}")]]
+            rows = [[IKB("➕ إضافة باقة جديدة لهذه الدولة", callback_data=f"adm_plan_add:{country_id}")]]
             for p in plans:
                 rows.append([
                     IKB(
-                        f"\U0001f4e6 {p['name']} \u2014 {float(p['price']):.2f} {currency} (\u0627\u0644\u0645\u062a\u0627\u062d: {int(p['available_count'] or 0)})",
+                        f"📦 {p['name']} — {float(p['price']):.2f} {currency} (المتاح: {int(p['available_count'] or 0)})",
                         callback_data=f"adm_plan_view:{p['id']}",
                     )
                 ])
-            rows.append([IKB("\U0001f519 \u0627\u062e\u062a\u064a\u0627\u0631 \u062f\u0648\u0644\u0629 \u0623\u062e\u0631\u0649", callback_data="adm_plans_SelectCountry")])
-            rows.append([IKB("\U0001f6e0 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
+            rows.append([IKB("🔙 اختيار دولة أخرى", callback_data="adm_plans_SelectCountry")])
+            rows.append([IKB("🛠 لوحة تحكم الأدمن", callback_data="adm_home")])
             text = (
-                f"\U0001f4e6 <b>\u0628\u0627\u0642\u0627\u062a \u062f\u0648\u0644\u0629: {html.escape(country['name'])}</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u0627\u0636\u063a\u0637 \u0639\u0644\u0649 \u0623\u064a \u0628\u0627\u0642\u0629 \u0644\u062a\u0639\u062f\u064a\u0644\u0647\u0627 \u0623\u0648 \u062d\u0630\u0641\u0647\u0627 \u0623\u0648 \u0625\u062f\u0627\u0631\u0629 \u0634\u0631\u0627\u0626\u062d \u0627\u0644\u0640 eSIM \u0627\u0644\u062e\u0627\u0635\u0629 \u0628\u0647\u0627:"
+                f"📦 <b>باقات دولة: {html.escape(country['name'])}</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "اضغط على أي باقة لتعديلها أو حذفها أو إدارة شرائح الـ eSIM الخاصة بها:"
             )
             await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
             return
@@ -1167,11 +1381,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data["state"] = "ADM_ADD_PLAN_NAME"
             context.user_data["temp"] = {"country_id": country_id}
             text = (
-                "\u2795 <b>\u0625\u0636\u0627\u0641\u0629 \u0628\u0627\u0642\u0629 \u062c\u062f\u064a\u062f\u0629 (\u0627\u0644\u062e\u0637\u0648\u0629 1 \u0645\u0646 3)</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0627\u0633\u0645 \u0627\u0644\u0628\u0627\u0642\u0629</b> (\u0645\u062b\u0627\u0644: <code>\u0628\u0627\u0642\u0629 10 \u062c\u064a\u062c\u0627\u0628\u0627\u064a\u062a - 30 \u064a\u0648\u0645</code>):"
+                "➕ <b>إضافة باقة جديدة (الخطوة 1 من 3)</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "أرسل الآن <b>اسم الباقة</b> (مثال: <code>باقة 10 جيجابايت - 30 يوم</code>):"
             )
-            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data=f"adm_plans_country:{country_id}")]])
+            kb = InlineKeyboardMarkup([[IKB("🔙 إلغاء", callback_data=f"adm_plans_country:{country_id}")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1183,19 +1397,19 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if not plan:
                 return
             text = (
-                f"\U0001f4e6 <b>\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0628\u0627\u0642\u0629: {html.escape(plan['name'])}</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                f"\U0001f30d <b>\u0627\u0644\u062f\u0648\u0644\u0629:</b> {html.escape(plan['country_name'])}\n"
-                f"\U0001f4b5 <b>\u0627\u0644\u0633\u0639\u0631:</b> {float(plan['price']):.2f} {html.escape(currency)}\n"
-                f"\U0001f4dd <b>\u0627\u0644\u0648\u0635\u0641:</b> {html.escape(plan['description'] or NO_DESC)}\n"
-                f"\U0001f4f2 <b>\u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0627\u0644\u0645\u062a\u0627\u062d\u0629 \u0628\u0627\u0644\u0645\u062e\u0632\u0648\u0646:</b> {int(plan['available_count'] or 0)} \u0634\u0631\u064a\u062d\u0629"
+                f"📦 <b>إدارة الباقة: {html.escape(plan['name'])}</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"🌍 <b>الدولة:</b> {html.escape(plan['country_name'])}\n"
+                f"💵 <b>السعر:</b> {float(plan['price']):.2f} {html.escape(currency)}\n"
+                f"📝 <b>الوصف:</b> {html.escape(plan['description'] or NO_DESC)}\n"
+                f"📲 <b>الشرائح المتاحة بالمخزون:</b> {int(plan['available_count'] or 0)} شريحة"
             )
             kb = InlineKeyboardMarkup([
-                [IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0634\u0631\u0627\u0626\u062d eSIM (LPA \u0623\u0648 QR)", callback_data=f"adm_esim_add:{plan_id}")],
-                [IKB("\U0001f4cb \u0639\u0631\u0636 \u0648\u062a\u0639\u062f\u064a\u0644/\u062d\u0630\u0641 \u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0628\u0627\u0644\u0645\u062e\u0632\u0648\u0646", callback_data=f"adm_esim_list:{plan_id}")],
-                [IKB("\u270f\ufe0f \u062a\u0639\u062f\u064a\u0644 \u0628\u064a\u0627\u0646\u0627\u062a \u0648\u0633\u0639\u0631 \u0627\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_edit:{plan_id}")],
-                [IKB("\U0001f5d1\ufe0f \u062d\u0630\u0641 \u0627\u0644\u0628\u0627\u0642\u0629 \u0646\u0647\u0627\u0626\u064a\u0627\u064b", callback_data=f"adm_plan_del:{plan_id}")],
-                [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0628\u0627\u0642\u0627\u062a \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plans_country:{plan['country_id']}")],
+                [IKB("➕ إضافة شرائح eSIM (LPA أو QR)", callback_data=f"adm_esim_add:{plan_id}")],
+                [IKB("📋 عرض وتعديل/حذف الشرائح بالمخزون", callback_data=f"adm_esim_list:{plan_id}")],
+                [IKB("✏️ تعديل بيانات وسعر الباقة", callback_data=f"adm_plan_edit:{plan_id}")],
+                [IKB("🗑️ حذف الباقة نهائياً", callback_data=f"adm_plan_del:{plan_id}")],
+                [IKB("🔙 العودة لباقات الدولة", callback_data=f"adm_plans_country:{plan['country_id']}")],
             ])
             await safe_edit_or_send(update, text, kb)
             return
@@ -1209,11 +1423,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data["state"] = "ADM_EDIT_PLAN_NAME"
             context.user_data["temp"] = {"plan_id": plan_id}
             text = (
-                f"\u270f\ufe0f <b>\u062a\u0639\u062f\u064a\u0644 \u0627\u0644\u0628\u0627\u0642\u0629: {html.escape(plan['name'])}</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u0623\u0631\u0633\u0644 <b>\u0627\u0644\u0627\u0633\u0645 \u0627\u0644\u062c\u062f\u064a\u062f \u0644\u0644\u0628\u0627\u0642\u0629</b> (\u0623\u0648 \u0623\u0631\u0633\u0644 \u0646\u0642\u0637\u0629 <code>.</code> \u0644\u0644\u0625\u0628\u0642\u0627\u0621 \u0639\u0644\u0649 \u0627\u0644\u0627\u0633\u0645 \u0627\u0644\u062d\u0627\u0644\u064a):"
+                f"✏️ <b>تعديل الباقة: {html.escape(plan['name'])}</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "أرسل <b>الاسم الجديد للباقة</b> (أو أرسل نقطة <code>.</code> للإبقاء على الاسم الحالي):"
             )
-            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data=f"adm_plan_view:{plan_id}")]])
+            kb = InlineKeyboardMarkup([[IKB("🔙 إلغاء", callback_data=f"adm_plan_view:{plan_id}")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1222,12 +1436,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             plan = db.get_plan(plan_id)
             country_id = plan["country_id"] if plan else 0
             db.delete_plan(plan_id)
-            await q.answer("\U0001f5d1\ufe0f \u062a\u0645 \u062d\u0630\u0641 \u0627\u0644\u0628\u0627\u0642\u0629 \u0628\u0646\u062c\u0627\u062d!", show_alert=True)
+            await q.answer("🗑️ تم حذف الباقة بنجاح!", show_alert=True)
             if country_id:
                 await safe_edit_or_send(
                     update,
-                    "\u2705 <b>\u062a\u0645 \u062d\u0630\u0641 \u0627\u0644\u0628\u0627\u0642\u0629 \u0628\u0646\u062c\u0627\u062d.</b>",
-                    InlineKeyboardMarkup([[IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0628\u0627\u0642\u0627\u062a \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plans_country:{country_id}")]]),
+                    "✅ <b>تم حذف الباقة بنجاح.</b>",
+                    InlineKeyboardMarkup([[IKB("🔙 العودة لباقات الدولة", callback_data=f"adm_plans_country:{country_id}")]]),
                 )
             else:
                 await show_admin_home(update, context)
@@ -1241,23 +1455,23 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if not countries:
                 await safe_edit_or_send(
                     update,
-                    "\u26a0\ufe0f <b>\u0644\u0627 \u062a\u0648\u062c\u062f \u062f\u0648\u0644 \u0645\u0636\u0627\u0641\u0629 \u0628\u0639\u062f. \u0642\u0645 \u0628\u0625\u0636\u0627\u0641\u0629 \u062f\u0648\u0644\u0629 \u0648\u0628\u0627\u0642\u0629 \u0623\u0648\u0644\u0627\u064b.</b>",
-                    InlineKeyboardMarkup([[IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")]]),
+                    "⚠️ <b>لا توجد دول مضافة بعد. قم بإضافة دولة وباقة أولاً.</b>",
+                    InlineKeyboardMarkup([[IKB("🔙 لوحة تحكم الأدمن", callback_data="adm_home")]]),
                 )
                 return
             rows = [
                 [
                     IKB(
-                        f"\U0001f30d {c['name']} (\u0627\u0644\u0645\u062a\u0627\u062d \u0628\u0627\u0644\u0645\u062e\u0632\u0648\u0646: {int(c['available_stock'] or 0)})",
+                        f"🌍 {c['name']} (المتاح بالمخزون: {int(c['available_stock'] or 0)})",
                         callback_data=f"adm_inv_country:{c['id']}",
                     )
                 ]
                 for c in countries
             ]
-            rows.append([IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
+            rows.append([IKB("🔙 لوحة تحكم الأدمن", callback_data="adm_home")])
             await safe_edit_or_send(
                 update,
-                "\U0001f4f2 <b>\u0625\u062f\u0627\u0631\u0629 \u0645\u062e\u0632\u0648\u0646 \u0627\u0644\u0634\u0631\u0627\u0626\u062d (eSIMs)</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u0627\u062e\u062a\u0631 \u0627\u0644\u062f\u0648\u0644\u0629 \u0644\u0639\u0631\u0636 \u0628\u0627\u0642\u0627\u062a\u0647\u0627 \u0648\u0625\u062f\u0627\u0631\u0629 \u0634\u0631\u0627\u0626\u062d\u0647\u0627:",
+                "📲 <b>إدارة مخزون الشرائح (eSIMs)</b>\n━━━━━━━━━━━━━━━━━━━━\nاختر الدولة لعرض باقاتها وإدارة شرائحها:",
                 InlineKeyboardMarkup(rows),
             )
             return
@@ -1270,10 +1484,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if not plans:
                 await safe_edit_or_send(
                     update,
-                    f"\u26a0\ufe0f <b>\u0644\u0627 \u062a\u0648\u062c\u062f \u0628\u0627\u0642\u0627\u062a \u0641\u064a \u062f\u0648\u0644\u0629 {html.escape(country['name'] if country else '')}. \u0623\u0636\u0641 \u0628\u0627\u0642\u0629 \u0623\u0648\u0644\u0627\u064b.</b>",
+                    f"⚠️ <b>لا توجد باقات في دولة {html.escape(country['name'] if country else '')}. أضف باقة أولاً.</b>",
                     InlineKeyboardMarkup([
-                        [IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0628\u0627\u0642\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data=f"adm_plan_add:{country_id}")],
-                        [IKB("\U0001f519 \u0631\u062c\u0648\u0639", callback_data="adm_inv_SelectCountry")],
+                        [IKB("➕ إضافة باقة جديدة", callback_data=f"adm_plan_add:{country_id}")],
+                        [IKB("🔙 رجوع", callback_data="adm_inv_SelectCountry")],
                     ]),
                 )
                 return
@@ -1281,14 +1495,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             for p in plans:
                 rows.append([
                     IKB(
-                        f"\U0001f4e6 {p['name']} (\u0627\u0644\u0645\u062a\u0648\u0641\u0631: {int(p['available_count'] or 0)} \u0634\u0631\u064a\u062d\u0629)",
+                        f"📦 {p['name']} (المتوفر: {int(p['available_count'] or 0)} شريحة)",
                         callback_data=f"adm_plan_view:{p['id']}",
                     )
                 ])
-            rows.append([IKB("\U0001f519 \u0627\u062e\u062a\u064a\u0627\u0631 \u062f\u0648\u0644\u0629 \u0623\u062e\u0631\u0649", callback_data="adm_inv_SelectCountry")])
+            rows.append([IKB("🔙 اختيار دولة أخرى", callback_data="adm_inv_SelectCountry")])
             await safe_edit_or_send(
                 update,
-                f"\U0001f4f2 <b>\u0627\u062e\u062a\u0631 \u0627\u0644\u0628\u0627\u0642\u0629 \u0644\u0625\u062f\u0627\u0631\u0629 \u0645\u062e\u0632\u0648\u0646 \u0627\u0644\u0634\u0631\u0627\u0626\u062d ({html.escape(country['name'])})</b>:",
+                f"📲 <b>اختر الباقة لإدارة مخزون الشرائح ({html.escape(country['name'])})</b>:",
                 InlineKeyboardMarkup(rows),
             )
             return
@@ -1296,63 +1510,69 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if data.startswith("adm_esim_add:"):
             await q.answer()
             plan_id = int(data.split(":")[1])
-            plan = db.get_plan(plan_id)
-            if not plan:
-                return
-            context.user_data["state"] = "ADM_ADD_ESIM"
-            context.user_data["temp"] = {"plan_id": plan_id}
-            text = (
-                f"\u2795 <b>\u0625\u0636\u0627\u0641\u0629 \u0634\u0631\u0627\u0626\u062d eSIM \u062c\u062f\u064a\u062f\u0629 \u0625\u0644\u0649 \u0627\u0644\u0645\u062e\u0632\u0648\u0646</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                f"\U0001f30d <b>\u0627\u0644\u062f\u0648\u0644\u0629:</b> {html.escape(plan['country_name'])}\n"
-                f"\U0001f4e6 <b>\u0627\u0644\u0628\u0627\u0642\u0629:</b> {html.escape(plan['name'])}\n\n"
-                "\U0001f4e5 <b>\u0643\u064a\u0641 \u064a\u0645\u0643\u0646\u0643 \u0627\u0644\u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u0622\u0646\u061f</b>\n"
-                "1\ufe0f\u20e3 <b>\u0625\u0631\u0633\u0627\u0644 \u0643\u0648\u062f LPA \u0646\u0635\u064a:</b> \u0623\u0631\u0633\u0644 \u0643\u0648\u062f \u0627\u0644\u0640 LPA \u0645\u0628\u0627\u0634\u0631\u0629 (\u0645\u062b\u0627\u0644: <code>LPA:1$smdp.io$XXXX</code>). \u0643\u0645\u0627 \u064a\u0645\u0643\u0646\u0643 \u0625\u0631\u0633\u0627\u0644 \u0639\u062f\u0629 \u0623\u0643\u0648\u0627\u062f \u0641\u064a \u0631\u0633\u0627\u0644\u0629 \u0648\u0627\u062d\u062f\u0629 (\u0643\u0644 \u0643\u0648\u062f \u0641\u064a \u0633\u0637\u0631 \u0645\u0633\u062a\u0642\u0644) \u0644\u0625\u0636\u0627\u0641\u062a\u0647\u0627 \u062f\u0641\u0639\u0629 \u0648\u0627\u062d\u062f\u0629!\n"
-                "2\ufe0f\u20e3 <b>\u0623\u0648 \u0625\u0631\u0633\u0627\u0644 \u0635\u0648\u0631\u0629 QR Code:</b> \u0623\u0631\u0633\u0644 \u0635\u0648\u0631\u0629 \u0643\u0648\u062f \u0627\u0644\u0640 QR \u0645\u0628\u0627\u0634\u0631\u0629 (\u0648\u064a\u0645\u0643\u0646\u0643 \u0643\u062a\u0627\u0628\u0629 \u0643\u0648\u062f \u0627\u0644\u0640 LPA \u0623\u0648 \u0645\u0644\u0627\u062d\u0638\u0627\u062a \u0641\u064a \u0648\u0635\u0641 \u0627\u0644\u0635\u0648\u0631\u0629 Caption).\n\n"
-                "\U0001f514 <i>\u0645\u0644\u0627\u062d\u0638\u0629: \u0628\u0645\u062c\u0631\u062f \u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u0634\u0631\u064a\u062d\u0629\u060c \u0633\u064a\u0642\u0648\u0645 \u0627\u0644\u0628\u0648\u062a \u062a\u0644\u0642\u0627\u0626\u064a\u0627\u064b \u0628\u0625\u0631\u0633\u0627\u0644 \u0625\u0634\u0639\u0627\u0631 \u0639\u0627\u0645 \u0644\u062c\u0645\u064a\u0639 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u064a\u0646 \u0628\u062a\u0648\u0641\u0631 \u0645\u062e\u0632\u0648\u0646 \u062c\u062f\u064a\u062f!</i>"
-            )
-            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621 \u0648\u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_view:{plan_id}")]])
-            await safe_edit_or_send(update, text, kb)
+            await render_admin_add_esim(update, context, plan_id, "all")
+            return
+
+        if data.startswith("adm_esim_mode:"):
+            parts = data.split(":")
+            plan_id = int(parts[1])
+            mode = parts[2] if len(parts) > 2 else "all"
+            await q.answer("✅ تم تحديث وضع الإشعار")
+            await render_admin_add_esim(update, context, plan_id, mode)
             return
 
         if data.startswith("adm_esim_list:"):
             await q.answer()
             clear_state(context)
-            plan_id = int(data.split(":")[1])
+            parts = data.split(":")
+            plan_id = int(parts[1])
+            page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
             plan = db.get_plan(plan_id)
             if not plan:
                 return
             esims = db.get_available_esims(plan_id)
             if not esims:
                 text = (
-                    f"\U0001f4cb <b>\u0645\u062e\u0632\u0648\u0646 \u0627\u0644\u0628\u0627\u0642\u0629: {html.escape(plan['name'])}</b>\n"
-                    "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                    "\u26a0\ufe0f \u0644\u0627 \u062a\u0648\u062c\u062f \u0634\u0631\u0627\u0626\u062d \u0645\u062a\u0627\u062d\u0629 \u062d\u0627\u0644\u064a\u0627\u064b \u0641\u064a \u0645\u062e\u0632\u0648\u0646 \u0647\u0630\u0647 \u0627\u0644\u0628\u0627\u0642\u0629."
+                    f"📋 <b>مخزون الباقة: {html.escape(plan['name'])}</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "⚠️ لا توجد شرائح متاحة حالياً في مخزون هذه الباقة."
                 )
                 kb = InlineKeyboardMarkup([
-                    [IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0634\u0631\u064a\u062d\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data=f"adm_esim_add:{plan_id}")],
-                    [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_view:{plan_id}")],
+                    [IKB("➕ إضافة شريحة جديدة", callback_data=f"adm_esim_add:{plan_id}")],
+                    [IKB("🔙 العودة للباقة", callback_data=f"adm_plan_view:{plan_id}")],
                 ])
                 await safe_edit_or_send(update, text, kb)
                 return
 
+            per_page = 20
+            total_pages = max(1, (len(esims) + per_page - 1) // per_page)
+            page = max(0, min(page, total_pages - 1))
+            page_esims = esims[page * per_page:(page + 1) * per_page]
             rows = []
-            for e in esims[:30]:
-                t_badge = "\U0001f511 LPA" if e["item_type"] == "lpa" else "\U0001f5bc QR"
-                short_code = (e["lpa_code"][:22] + "...") if e["lpa_code"] and len(e["lpa_code"]) > 22 else (e["lpa_code"] or "\u0635\u0648\u0631\u0629 QR")
+            for e in page_esims:
+                t_badge = "🔑 LPA" if e["item_type"] == "lpa" else "🖼 QR"
+                short_code = (e["lpa_code"][:22] + "...") if e["lpa_code"] and len(e["lpa_code"]) > 22 else (e["lpa_code"] or "صورة QR")
                 rows.append([
                     IKB(
                         f"#{e['id']} | {t_badge} | {short_code}",
                         callback_data=f"adm_esim_item:{e['id']}",
                     )
                 ])
-            rows.append([IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0634\u0631\u064a\u062d\u0629 \u062c\u062f\u064a\u062f\u0629", callback_data=f"adm_esim_add:{plan_id}")])
-            rows.append([IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_view:{plan_id}")])
+            if total_pages > 1:
+                nav = []
+                if page > 0:
+                    nav.append(IKB("⬅️ السابق", callback_data=f"adm_esim_list:{plan_id}:{page - 1}"))
+                nav.append(IKB(f"📄 {page + 1}/{total_pages}", callback_data=f"adm_esim_list:{plan_id}:{page}"))
+                if page + 1 < total_pages:
+                    nav.append(IKB("التالي ➡️", callback_data=f"adm_esim_list:{plan_id}:{page + 1}"))
+                rows.append(nav)
+            rows.append([IKB("➕ إضافة شريحة جديدة", callback_data=f"adm_esim_add:{plan_id}")])
+            rows.append([IKB("🔙 العودة للباقة", callback_data=f"adm_plan_view:{plan_id}")])
             text = (
-                f"\U0001f4cb <b>\u0627\u0644\u0634\u0631\u0627\u0626\u062d \u0627\u0644\u0645\u062a\u0627\u062d\u0629 \u0641\u064a \u0645\u062e\u0632\u0648\u0646: {html.escape(plan['name'])}</b>\n"
-                f"\u0625\u062c\u0645\u0627\u0644\u064a \u0627\u0644\u0645\u062a\u0627\u062d: <b>{len(esims)}</b> \u0634\u0631\u064a\u062d\u0629.\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\U0001f447 \u0627\u0636\u063a\u0637 \u0639\u0644\u0649 \u0623\u064a \u0634\u0631\u064a\u062d\u0629 \u0644\u0645\u0639\u0627\u064a\u0646\u062a\u0647\u0627 \u0623\u0648 \u062a\u0639\u062f\u064a\u0644\u0647\u0627 \u0623\u0648 \u062d\u0630\u0641\u0647\u0627 \u0645\u0646 \u0627\u0644\u0645\u062e\u0632\u0648\u0646:"
+                f"📋 <b>الشرائح المتاحة في مخزون: {html.escape(plan['name'])}</b>\n"
+                f"إجمالي المتاح: <b>{len(esims)}</b> شريحة.\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "👇 اضغط على أي شريحة لمعاينتها أو تعديلها أو حذفها من المخزون:"
             )
             await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
             return
@@ -1363,40 +1583,62 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             esim_id = int(data.split(":")[1])
             esim = db.get_esim(esim_id)
             if not esim:
-                await q.answer("\u26a0\ufe0f \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u063a\u064a\u0631 \u0645\u0648\u062c\u0648\u062f\u0629.", show_alert=True)
+                await q.answer("⚠️ الشريحة غير موجودة.", show_alert=True)
                 return
-            t_label = "\u0643\u0648\u062f \u0646\u0635\u064a (LPA)" if esim["item_type"] == "lpa" else "\u0635\u0648\u0631\u0629 \u0643\u0648\u062f (QR Code)"
+            sold = esim.get("status") == "sold"
+            status = "✅ مباعة" if sold else "🟢 متاحة بالمخزون"
+            label = "كود نصي (LPA)" if esim["item_type"] == "lpa" else "صورة QR"
+            extra = ""
+            if sold:
+                buyer = html.escape(esim.get("buyer_full_name") or "")
+                username = "@" + html.escape(esim["buyer_username"]) if esim.get("buyer_username") else "بدون يوزر"
+                refunds = db.get_esim_refunds(esim_id)
+                refund_text = "لا توجد طلبات استرداد"
+                if refunds:
+                    refund_text = "، ".join(
+                        f"#{r['id']} ({'قيد المراجعة' if r['status']=='pending' else 'تمت المراجعة'})"
+                        for r in refunds
+                    )
+                extra = (
+                    f"\n👤 <b>المشتري:</b> {buyer} ({username})\n"
+                    f"🆔 <b>معرف المشتري:</b> <code>{esim.get('sold_to') or ''}</code>\n"
+                    f"💵 <b>سعر البيع:</b> <code>{float(esim.get('sold_price') or 0):.2f}</code> {html.escape(currency)}\n"
+                    f"🕒 <b>وقت البيع:</b> {esim.get('sold_at') or ''}\n"
+                    f"↩️ <b>طلبات الاسترداد:</b> {refund_text}"
+                )
             text = (
-                f"\U0001f50e <b>\u062a\u0641\u0627\u0635\u064a\u0644 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0628\u0627\u0644\u0645\u062e\u0632\u0648\u0646 #{esim['id']}</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                f"\U0001f30d <b>\u0627\u0644\u062f\u0648\u0644\u0629:</b> {html.escape(esim['country_name'])}\n"
-                f"\U0001f4e6 <b>\u0627\u0644\u0628\u0627\u0642\u0629:</b> {html.escape(esim['plan_name'])}\n"
-                f"\U0001f3f7 <b>\u0627\u0644\u0646\u0648\u0639:</b> {t_label}\n"
-                f"\U0001f511 <b>\u0643\u0648\u062f LPA:</b> <code>{html.escape(esim['lpa_code'] or NO_LPA_QR)}</code>\n"
-                f"\U0001f4dd <b>\u0645\u0644\u0627\u062d\u0638\u0627\u062a:</b> {html.escape(esim['notes'] or NONE_STR)}\n"
-                f"\U0001f4c5 <b>\u062a\u0627\u0631\u064a\u062e \u0627\u0644\u0625\u0636\u0627\u0641\u0629:</b> {esim['created_at']}"
+                f"🔎 <b>تفاصيل الشريحة #{esim['id']}</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                f"📌 <b>الحالة:</b> {status}\n"
+                f"🌍 <b>الدولة:</b> {html.escape(esim['country_name'])}\n"
+                f"📦 <b>الباقة:</b> {html.escape(esim['plan_name'])}\n"
+                f"🏷 <b>النوع:</b> {label}\n"
+                f"🔑 <b>كود LPA:</b> <code>{html.escape(esim['lpa_code'] or NO_LPA_QR)}</code>\n"
+                f"📝 <b>ملاحظات:</b> {html.escape(esim['notes'] or NONE_STR)}\n"
+                f"📅 <b>تاريخ الإضافة:</b> {esim.get('created_at') or ''}{extra}"
             )
-            kb = InlineKeyboardMarkup([
-                [IKB("\U0001f441 \u0645\u0639\u0627\u064a\u0646\u0629 \u0643\u0648\u062f \u0627\u0644\u0640 QR \u0643\u0645\u0627 \u064a\u0638\u0647\u0631 \u0644\u0644\u0639\u0645\u064a\u0644", callback_data=f"adm_esim_preview:{esim['id']}")],
-                [IKB("\u270f\ufe0f \u062a\u0639\u062f\u064a\u0644 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 (LPA \u0623\u0648 QR)", callback_data=f"adm_esim_edit:{esim['id']}")],
-                [IKB("\U0001f5d1\ufe0f \u062d\u0630\u0641 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0645\u0646 \u0627\u0644\u0645\u062e\u0632\u0648\u0646", callback_data=f"adm_esim_del:{esim['id']}")],
-                [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0634\u0631\u0627\u0626\u062d", callback_data=f"adm_esim_list:{esim['plan_id']}")],
-            ])
-            await safe_edit_or_send(update, text, kb)
+            rows = [[IKB("👁 معاينة الشريحة", callback_data=f"adm_esim_preview:{esim_id}")]]
+            if sold:
+                if esim.get("sold_to"):
+                    rows.append([IKB("👤 ملف المشتري", callback_data=f"adm_user_view:{esim['sold_to']}")])
+                rows.append([IKB("🧾 أحدث المبيعات", callback_data="adm_recent_sales:0"), IKB("🔍 مركز الفحص", callback_data="adm_inspector")])
+            else:
+                rows.append([IKB("✏️ تعديل الشريحة", callback_data=f"adm_esim_edit:{esim_id}"), IKB("🗑️ حذف الشريحة", callback_data=f"adm_esim_del:{esim_id}")])
+                rows.append([IKB("🔙 العودة للمخزون", callback_data=f"adm_esim_list:{esim['plan_id']}")])
+            await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
             return
 
         if data.startswith("adm_esim_preview:"):
             esim_id = int(data.split(":")[1])
             esim = db.get_esim(esim_id)
             if not esim:
-                await q.answer("\u26a0\ufe0f \u063a\u064a\u0631 \u0645\u0648\u062c\u0648\u062f\u0629.", show_alert=True)
+                await q.answer("⚠️ غير موجودة.", show_alert=True)
                 return
-            await q.answer("\U0001f441 \u062c\u0627\u0631\u064a \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0645\u0639\u0627\u064a\u0646\u0629...")
+            await q.answer("👁 جاري إرسال المعاينة...")
             await deliver_esim_to_chat(
                 context=context,
                 chat_id=user.id,
                 esim=esim,
-                header_title=f"\U0001f441 <b>\u0645\u0639\u0627\u064a\u0646\u0629 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0628\u0627\u0644\u0645\u062e\u0632\u0648\u0646 (#{esim['id']})</b>",
+                header_title=f"👁 <b>معاينة الشريحة بالمخزون (#{esim['id']})</b>",
             )
             return
 
@@ -1409,11 +1651,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data["state"] = "ADM_EDIT_ESIM"
             context.user_data["temp"] = {"esim_id": esim_id, "plan_id": esim["plan_id"]}
             text = (
-                f"\u270f\ufe0f <b>\u062a\u0639\u062f\u064a\u0644 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0631\u0642\u0645 #{esim_id}</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0643\u0648\u062f \u0627\u0644\u0640 LPA \u0627\u0644\u062c\u062f\u064a\u062f</b> \u0643\u0646\u0635\u060c \u0623\u0648 \u0623\u0631\u0633\u0644 <b>\u0635\u0648\u0631\u0629 QR Code \u062c\u062f\u064a\u062f\u0629</b> \u0644\u062a\u062d\u062f\u064a\u062b \u0647\u0630\u0647 \u0627\u0644\u0634\u0631\u064a\u062d\u0629:"
+                f"✏️ <b>تعديل الشريحة رقم #{esim_id}</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "أرسل الآن <b>كود الـ LPA الجديد</b> كنص، أو أرسل <b>صورة QR Code جديدة</b> لتحديث هذه الشريحة:"
             )
-            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data=f"adm_esim_item:{esim_id}")]])
+            kb = InlineKeyboardMarkup([[IKB("🔙 إلغاء", callback_data=f"adm_esim_item:{esim_id}")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1422,12 +1664,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             esim = db.get_esim(esim_id)
             plan_id = esim["plan_id"] if esim else 0
             db.delete_esim(esim_id)
-            await q.answer("\U0001f5d1\ufe0f \u062a\u0645 \u062d\u0630\u0641 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0645\u0646 \u0627\u0644\u0645\u062e\u0632\u0648\u0646!", show_alert=True)
+            await q.answer("🗑️ تم حذف الشريحة من المخزون!", show_alert=True)
             if plan_id:
                 await safe_edit_or_send(
                     update,
-                    "\u2705 <b>\u062a\u0645 \u062d\u0630\u0641 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0645\u0646 \u0627\u0644\u0645\u062e\u0632\u0648\u0646 \u0628\u0646\u062c\u0627\u062d.</b>",
-                    InlineKeyboardMarkup([[IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0634\u0631\u0627\u0626\u062d", callback_data=f"adm_esim_list:{plan_id}")]]),
+                    "✅ <b>تم حذف الشريحة من المخزون بنجاح.</b>",
+                    InlineKeyboardMarkup([[IKB("🔙 العودة لقائمة الشرائح", callback_data=f"adm_esim_list:{plan_id}")]]),
                 )
             return
 
@@ -1440,16 +1682,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             for req in pending[:20]:
                 rows.append([
                     IKB(
-                        f"\u23f3 \u0637\u0644\u0628 #{req['id']} | {req['full_name'] or req['user_id']} | {req['country_name']} - {req['plan_name']} ({float(req['refund_amount'] or 0):.2f} {currency})",
+                        f"⏳ طلب #{req['id']} | {req['full_name'] or req['user_id']} | {req['country_name']} - {req['plan_name']} ({float(req['refund_amount'] or 0):.2f} {currency})",
                         callback_data=f"adm_refund_view:{req['id']}",
                     )
                 ])
-            rows.append([IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
+            rows.append([IKB("🔙 لوحة تحكم الأدمن", callback_data="adm_home")])
             text = (
-                "\u21a9\ufe0f <b>\u0637\u0644\u0628\u0627\u062a \u0627\u0644\u0627\u0633\u062a\u0631\u062f\u0627\u062f \u0627\u0644\u0645\u0639\u0644\u0642\u0629</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                f"\u0627\u0644\u0639\u062f\u062f \u0627\u0644\u062d\u0627\u0644\u064a: <b>{len(pending)}</b> \u0637\u0644\u0628\n\n"
-                "\u0627\u0636\u063a\u0637 \u0639\u0644\u0649 \u0623\u064a \u0637\u0644\u0628 \u0644\u0639\u0631\u0636 \u0641\u064a\u062f\u064a\u0648 \u0627\u0644\u0625\u062b\u0628\u0627\u062a \u0648\u0627\u0644\u062a\u0641\u0627\u0635\u064a\u0644 \u0648\u0627\u0644\u0628\u062a \u0641\u064a\u0647:"
+                "↩️ <b>طلبات الاسترداد المعلقة</b>\n"
+                "━━━━━━━━━━━━━━━━━━━\n"
+                f"العدد الحالي: <b>{len(pending)}</b> طلب\n\n"
+                "اضغط على أي طلب لعرض فيديو الإثبات والتفاصيل والبت فيه:"
             )
             await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
             return
@@ -1461,8 +1703,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if not req:
                 return
             adm_kb = InlineKeyboardMarkup([
-                [IKB("\u2705 \u062a\u0645\u062a \u0627\u0644\u0645\u0631\u0627\u062c\u0639\u0629 (\u0628\u062f\u0648\u0646 \u062a\u0639\u062f\u064a\u0644 \u0631\u0635\u064a\u062f)", callback_data=f"adm_refund_done:{req['id']}")],
-                [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0637\u0644\u0628\u0627\u062a", callback_data="adm_refunds_menu")],
+                [IKB("✅ تمت المراجعة (بدون تعديل رصيد)", callback_data=f"adm_refund_done:{req['id']}")],
+                [IKB("🔙 العودة للطلبات", callback_data="adm_refunds_menu")],
             ])
             await send_refund_video_to_admin(context, req, markup=adm_kb)
             return
@@ -1471,22 +1713,22 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             req_id = int(data.split(":")[1])
             ok, status, res = db.mark_refund_reviewed(req_id)
             if not ok:
-                await q.answer("\u26a0\ufe0f \u062a\u0645 \u0645\u0639\u0627\u0644\u062c\u0629 \u0647\u0630\u0627 \u0627\u0644\u0637\u0644\u0628 \u0645\u0633\u0628\u0642\u0627\u064b \u0623\u0648 \u0623\u0646\u0647 \u063a\u064a\u0631 \u0645\u0648\u062c\u0648\u062f.", show_alert=True)
+                await q.answer("⚠️ تم معالجة هذا الطلب مسبقاً أو أنه غير موجود.", show_alert=True)
                 return
 
-            await q.answer("\u2705 \u062a\u0645 \u062a\u0639\u064a\u064a\u0646 \u0627\u0644\u0637\u0644\u0628 \u0643\u0645\u062a\u0645\u0629 \u0645\u0631\u0627\u062c\u0639\u062a\u0647.", show_alert=True)
+            await q.answer("✅ تم تعيين الطلب كمتمة مراجعته.", show_alert=True)
             # Review-only: no balance is credited or debited here. Any compensation
             # remains a manual owner decision (e.g. the existing manual balance tool).
             user_msg = (
-                f"\U0001f4cb <b>\u062a\u0645\u062a \u0645\u0631\u0627\u062c\u0639\u0629 \u0637\u0644\u0628 \u0627\u0644\u0627\u0633\u062a\u0631\u062f\u0627\u062f \u0631\u0642\u0645 #{req_id}.</b>\n"
-                "\u0633\u064a\u062a\u0648\u0627\u0635\u0644 \u0645\u0639\u0643 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a \u0628\u062e\u0635\u0648\u0635 \u0646\u062a\u064a\u062c\u0629 \u0627\u0644\u0637\u0644\u0628."
+                f"📋 <b>تمت مراجعة طلب الاسترداد رقم #{req_id}.</b>\n"
+                "سيتواصل معك الدعم الفني بخصوص نتيجة الطلب."
             )
             try:
                 await context.bot.send_message(
                     chat_id=res["user_id"],
                     text=user_msg,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([[IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
+                    reply_markup=InlineKeyboardMarkup([[IKB("🏠 القائمة الرئيسية", callback_data="home")]]),
                 )
             except TelegramError:
                 pass
@@ -1501,22 +1743,22 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             clear_state(context)
             pending = db.get_pending_topups()
             rows = [
-                [IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 / \u062e\u0635\u0645 \u0631\u0635\u064a\u062f \u0644\u0645\u0633\u062a\u062e\u062f\u0645 \u064a\u062f\u0648\u064a\u0627\u064b", callback_data="adm_bal_manual")],
+                [IKB("➕ إضافة / خصم رصيد لمستخدم يدوياً", callback_data="adm_bal_manual")],
             ]
             for req in pending[:20]:
-                m_icon = "\U0001f7e1 Binance" if req["method"] == "binance" else "\U0001f7e3 InstaPay"
+                m_icon = "🟡 Binance" if req["method"] == "binance" else "🟣 InstaPay"
                 rows.append([
                     IKB(
-                        f"\u23f3 \u0637\u0644\u0628 #{req['id']} | {m_icon} | {float(req['amount']):.2f} {currency}",
+                        f"⏳ طلب #{req['id']} | {m_icon} | {float(req['amount']):.2f} {currency}",
                         callback_data=f"adm_topup_view:{req['id']}",
                     )
                 ])
-            rows.append([IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
+            rows.append([IKB("🔙 لوحة تحكم الأدمن", callback_data="adm_home")])
             text = (
-                "\U0001f4b3 <b>\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0623\u0631\u0635\u062f\u0629 \u0648\u0637\u0644\u0628\u0627\u062a \u0627\u0644\u0634\u062d\u0646</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                f"\u23f3 <b>\u0637\u0644\u0628\u0627\u062a \u0627\u0644\u0634\u062d\u0646 \u0627\u0644\u0645\u0639\u0644\u0642\u0629 \u062d\u0627\u0644\u064a\u0627\u064b:</b> {len(pending)} \u0637\u0644\u0628\n\n"
-                "\u064a\u0645\u0643\u0646\u0643 \u062a\u0639\u062f\u064a\u0644 \u0631\u0635\u064a\u062f \u0623\u064a \u0645\u0633\u062a\u062e\u062f\u0645 \u064a\u062f\u0648\u064a\u0627\u064b \u0623\u0648 \u0645\u0631\u0627\u062c\u0639\u0629 \u0637\u0644\u0628\u0627\u062a \u0627\u0644\u0634\u062d\u0646 \u0628\u0627\u0644\u0623\u0633\u0641\u0644:"
+                "💳 <b>إدارة الأرصدة وطلبات الشحن</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"⏳ <b>طلبات الشحن المعلقة حالياً:</b> {len(pending)} طلب\n\n"
+                "يمكنك تعديل رصيد أي مستخدم يدوياً أو مراجعة طلبات الشحن بالأسفل:"
             )
             await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
             return
@@ -1527,23 +1769,23 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             req = db.get_topup_request(req_id)
             if not req:
                 return
-            m_name = "Binance Pay (\u0639\u0645\u0644\u0627\u062a \u0631\u0642\u0645\u064a\u0629)" if req["method"] == "binance" else "InstaPay EG (\u0625\u0646\u0633\u062a\u0627 \u0628\u0627\u064a)"
+            m_name = "Binance Pay (عملات رقمية)" if req["method"] == "binance" else "InstaPay EG (إنستا باي)"
             text = (
-                f"\U0001f9fe <b>\u062a\u0641\u0627\u0635\u064a\u0644 \u0637\u0644\u0628 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f #{req['id']}</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                f"\U0001f464 <b>\u0627\u0644\u0639\u0645\u064a\u0644:</b> {html.escape(req['full_name'] or '')} (@{html.escape(req['username'] or NO_USER)})\n"
-                f"\U0001f194 <b>\u0645\u0639\u0631\u0641 \u0627\u0644\u0639\u0645\u064a\u0644:</b> <code>{req['user_id']}</code>\n"
-                f"\U0001f4b3 <b>\u0627\u0644\u0648\u0633\u064a\u0644\u0629:</b> {m_name}\n"
-                f"\U0001f4b5 <b>\u0627\u0644\u0645\u0628\u0644\u063a \u0627\u0644\u0645\u0637\u0644\u0648\u0628:</b> <code>{float(req['amount']):.2f}</code> {html.escape(currency)}\n"
-                f"\U0001f4dd <b>\u0628\u064a\u0627\u0646\u0627\u062a \u0627\u0644\u062a\u062d\u0648\u064a\u0644 \u0627\u0644\u0645\u0631\u0633\u0644\u0629:</b> {html.escape(req['proof_text'] or ATTACHED_RECEIPT)}\n"
-                f"\U0001f4c5 <b>\u0627\u0644\u062a\u0627\u0631\u064a\u062e:</b> {req['created_at']}"
+                f"🧾 <b>تفاصيل طلب شحن الرصيد #{req['id']}</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>العميل:</b> {html.escape(req['full_name'] or '')} (@{html.escape(req['username'] or NO_USER)})\n"
+                f"🆔 <b>معرف العميل:</b> <code>{req['user_id']}</code>\n"
+                f"💳 <b>الوسيلة:</b> {m_name}\n"
+                f"💵 <b>المبلغ المطلوب:</b> <code>{float(req['amount']):.2f}</code> {html.escape(currency)}\n"
+                f"📝 <b>بيانات التحويل المرسلة:</b> {html.escape(req['proof_text'] or ATTACHED_RECEIPT)}\n"
+                f"📅 <b>التاريخ:</b> {req['created_at']}"
             )
             kb = InlineKeyboardMarkup([
                 [
-                    IKB("\u2705 \u0642\u0628\u0648\u0644 \u0648\u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u0631\u0635\u064a\u062f", callback_data=f"adm_topup_ok:{req['id']}"),
-                    IKB("\u274c \u0631\u0641\u0636 \u0627\u0644\u0637\u0644\u0628", callback_data=f"adm_topup_no:{req['id']}"),
+                    IKB("✅ قبول وإضافة الرصيد", callback_data=f"adm_topup_ok:{req['id']}"),
+                    IKB("❌ رفض الطلب", callback_data=f"adm_topup_no:{req['id']}"),
                 ],
-                [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0637\u0644\u0628\u0627\u062a", callback_data="adm_topups_menu")],
+                [IKB("🔙 العودة لقائمة الطلبات", callback_data="adm_topups_menu")],
             ])
             if req.get("proof_file_id"):
                 try:
@@ -1565,24 +1807,24 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             req_id = int(data.split(":")[1])
             ok, status, res = db.process_topup_request(req_id, approve=approve)
             if not ok:
-                await q.answer("\u26a0\ufe0f \u062a\u0645 \u0645\u0639\u0627\u0644\u062c\u0629 \u0647\u0630\u0627 \u0627\u0644\u0637\u0644\u0628 \u0645\u0633\u0628\u0642\u0627\u064b \u0623\u0648 \u0623\u0646\u0647 \u063a\u064a\u0631 \u0645\u0648\u062c\u0648\u062f.", show_alert=True)
+                await q.answer("⚠️ تم معالجة هذا الطلب مسبقاً أو أنه غير موجود.", show_alert=True)
                 return
 
             if approve:
-                await q.answer("\u2705 \u062a\u0645 \u0642\u0628\u0648\u0644 \u0627\u0644\u0637\u0644\u0628 \u0648\u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u0631\u0635\u064a\u062f \u0644\u0644\u0639\u0645\u064a\u0644!", show_alert=True)
+                await q.answer("✅ تم قبول الطلب وإضافة الرصيد للعميل!", show_alert=True)
                 user_msg = (
-                    "\U0001f389 <b>\u062a\u0645 \u0642\u0628\u0648\u0644 \u0637\u0644\u0628 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0627\u0644\u062e\u0627\u0635 \u0628\u0643!</b>\n"
-                    "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                    f"\u2795 <b>\u0627\u0644\u0645\u0628\u0644\u063a \u0627\u0644\u0645\u0636\u0627\u0641:</b> <code>{float(res['amount']):.2f}</code> {html.escape(currency)}\n"
-                    f"\U0001f4b0 <b>\u0631\u0635\u064a\u062f\u0643 \u0627\u0644\u062d\u0627\u0644\u064a:</b> <code>{float(res['new_balance']):.2f}</code> {html.escape(currency)}\n\n"
-                    "\u0634\u0643\u0631\u0627\u064b \u0644\u062b\u0642\u062a\u0643 \u0628\u0646\u0627! \u064a\u0645\u0643\u0646\u0643 \u0627\u0644\u0622\u0646 \u0634\u0631\u0627\u0621 \u0634\u0631\u064a\u062d\u062a\u0643 \u0641\u0648\u0631\u0627\u064b."
+                    "🎉 <b>تم قبول طلب شحن الرصيد الخاص بك!</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"➕ <b>المبلغ المضاف:</b> <code>{float(res['amount']):.2f}</code> {html.escape(currency)}\n"
+                    f"💰 <b>رصيدك الحالي:</b> <code>{float(res['new_balance']):.2f}</code> {html.escape(currency)}\n\n"
+                    "شكراً لثقتك بنا! يمكنك الآن شراء شريحتك فوراً."
                 )
             else:
-                await q.answer("\u274c \u062a\u0645 \u0631\u0641\u0636 \u0637\u0644\u0628 \u0627\u0644\u0634\u062d\u0646.", show_alert=True)
+                await q.answer("❌ تم رفض طلب الشحن.", show_alert=True)
                 user_msg = (
-                    "\u274c <b>\u0646\u0639\u062a\u0630\u0631\u060c \u062a\u0645 \u0631\u0641\u0636 \u0637\u0644\u0628 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0631\u0642\u0645 #{req_id}.</b>\n"
-                    f"\u0627\u0644\u0645\u0628\u0644\u063a: {float(res['amount']):.2f} {html.escape(currency)}\n"
-                    "\u064a\u0631\u062c\u0649 \u0627\u0644\u062a\u0623\u0643\u062f \u0645\u0646 \u0625\u064a\u0635\u0627\u0644 \u0627\u0644\u062a\u062d\u0648\u064a\u0644 \u0623\u0648 \u0627\u0644\u062a\u0648\u0627\u0635\u0644 \u0645\u0639 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a."
+                    "❌ <b>نعتذر، تم رفض طلب شحن الرصيد رقم #{req_id}.</b>\n"
+                    f"المبلغ: {float(res['amount']):.2f} {html.escape(currency)}\n"
+                    "يرجى التأكد من إيصال التحويل أو التواصل مع الدعم الفني."
                 ).replace("{req_id}", str(req_id))
 
             try:
@@ -1590,7 +1832,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     chat_id=res["user_id"],
                     text=user_msg,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([[IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
+                    reply_markup=InlineKeyboardMarkup([[IKB("🏠 القائمة الرئيسية", callback_data="home")]]),
                 )
             except TelegramError:
                 pass
@@ -1602,12 +1844,147 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.answer()
             context.user_data["state"] = "ADM_MANUAL_BAL_USER"
             text = (
-                "\U0001f4b0 <b>\u0625\u0636\u0627\u0641\u0629 \u0623\u0648 \u062e\u0635\u0645 \u0631\u0635\u064a\u062f \u0644\u0645\u0633\u062a\u062e\u062f\u0645</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0645\u0639\u0631\u0641 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 (User ID)</b> \u0627\u0644\u0630\u064a \u062a\u0631\u064a\u062f \u062a\u0639\u062f\u064a\u0644 \u0631\u0635\u064a\u062f\u0647:"
+                "💰 <b>إضافة أو خصم رصيد لمستخدم</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "أرسل الآن <b>معرف المستخدم (User ID)</b> الذي تريد تعديل رصيده:"
             )
-            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_topups_menu")]])
+            kb = InlineKeyboardMarkup([[IKB("🔙 إلغاء", callback_data="adm_topups_menu")]])
             await safe_edit_or_send(update, text, kb)
+            return
+
+        # ---------------- ADMIN: ANALYTICS, EXPORT & INSPECTOR ----------------
+        if data == "adm_analytics":
+            await q.answer()
+            clear_state(context)
+            a = db.get_revenue_analytics()
+            top = "\n".join(
+                f"{i}. {html.escape(x['country_name'])} — {html.escape(x['plan_name'])}: {x['sold_count']} مباعة، {float(x['revenue']):.2f} {html.escape(currency)}"
+                for i, x in enumerate(a["top_plans"], 1)
+            ) or "لا توجد مبيعات للباقات حتى الآن."
+            text = (
+                "📊 <b>تحليلات الإيرادات</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                f"📅 اليوم: {a['today_sold']} شريحة — <code>{a['today_revenue']:.2f}</code> {html.escape(currency)}\n"
+                f"📆 آخر 7 أيام: {a['week_sold']} — <code>{a['week_revenue']:.2f}</code> {html.escape(currency)}\n"
+                f"🗓 آخر 30 يوماً: {a['month_sold']} — <code>{a['month_revenue']:.2f}</code> {html.escape(currency)}\n"
+                f"💰 إجمالي المبيعات: {a['sold_esims']} — <code>{a['total_revenue']:.2f}</code> {html.escape(currency)}\n"
+                f"💳 الشحن المقبول: {a['approved_topups_count']} — <code>{a['approved_topups_total']:.2f}</code> {html.escape(currency)}\n"
+                f"  Binance Pay: <code>{a['binance_topups_total']:.2f}</code> | InstaPay: <code>{a['instapay_topups_total']:.2f}</code>\n"
+                f"🏦 أرصدة المحافظ الحالية: <code>{a['total_user_balances']:.2f}</code> {html.escape(currency)}\n"
+                f"📲 المخزون المتاح: {a['available_esims']} | 🔔 تنبيهات التوفر: {a['active_stock_alerts']}\n\n"
+                f"🏆 <b>أفضل الباقات:</b>\n{top}\n\n📥 <b>تصدير البيانات:</b>"
+            )
+            kb = InlineKeyboardMarkup([
+                [IKB("📥 تصدير المبيعات CSV", callback_data="adm_export_csv:sales")],
+                [IKB("📥 تصدير المخزون CSV", callback_data="adm_export_csv:inventory")],
+                [IKB("📥 تصدير المستخدمين CSV", callback_data="adm_export_csv:users")],
+                [IKB("🧾 أحدث المبيعات", callback_data="adm_recent_sales:0"), IKB("🔄 تحديث", callback_data="adm_analytics")],
+                [IKB("🔙 لوحة الأدمن", callback_data="adm_home")],
+            ])
+            await safe_edit_or_send(update, text, kb)
+            return
+
+        if data.startswith("adm_export_csv:"):
+            kind = data.split(":")[1]
+            await q.answer("📥 جاري تجهيز ملف CSV...")
+            stamp = datetime.utcnow().strftime("%Y%m%d_%H%M")
+            sio = io.StringIO()
+            sio.write("\ufeff")
+            writer = csv.writer(sio)
+            if kind == "sales":
+                data_rows = db.get_sales_export_rows()
+                writer.writerow(["رقم الشريحة", "الدولة", "الباقة", "النوع", f"سعر البيع ({currency})", "معرف المشتري", "يوزر المشتري", "اسم المشتري", "وقت البيع"])
+                for r in data_rows:
+                    writer.writerow([r["esim_id"], r["country_name"], r["plan_name"], r["item_type"], r["sold_price"], r["buyer_id"], r["buyer_username"], r["buyer_full_name"], r["sold_at"]])
+                filename=f"sales_{stamp}.csv"
+            elif kind == "inventory":
+                data_rows = db.get_inventory_export_rows()
+                writer.writerow(["رقم الشريحة", "الحالة", "الدولة", "الباقة", "نوع الشريحة", "كود LPA", "ملاحظات", "معرف المشتري", "سعر البيع", "تاريخ الإضافة", "تاريخ البيع"])
+                for r in data_rows:
+                    writer.writerow([r["esim_id"], r["status"], r["country_name"], r["plan_name"], r["item_type"], r["lpa_code"], r["notes"], r["buyer_id"], r["sold_price"], r["created_at"], r["sold_at"]])
+                filename=f"inventory_{stamp}.csv"
+            else:
+                data_rows = db.get_users_export_rows()
+                writer.writerow(["معرف المستخدم", "اسم المستخدم", "الاسم", "الرصيد", "محظور", "عدد المشتريات", "إجمالي الإنفاق", "تاريخ التسجيل"])
+                for r in data_rows:
+                    writer.writerow([r["user_id"], r["username"], r["full_name"], r["balance"], "نعم" if r["is_banned"] else "لا", r["purchases_count"], r["total_spent"], r["created_at"]])
+                filename=f"users_{stamp}.csv"
+            bio=io.BytesIO(sio.getvalue().encode("utf-8"))
+            bio.seek(0)
+            await context.bot.send_document(chat_id=user.id, document=InputFile(bio, filename=filename), caption=f"✅ تم تجهيز التصدير ({len(data_rows)} سجل).")
+            return
+
+        if data == "adm_inspector":
+            await q.answer()
+            clear_state(context)
+            text = "🔍 <b>مركز الفحص</b>\n━━━━━━━━━━━━━━━━━━━━\nابحث عن شريحة بالرقم، أو عميل بالمعرف / @username، أو استعرض أحدث المبيعات."
+            kb = InlineKeyboardMarkup([
+                [IKB("🔎 بحث عن شريحة #ID", callback_data="adm_lookup_esim")],
+                [IKB("👤 بحث عن عميل", callback_data="adm_lookup_user")],
+                [IKB("🧾 أحدث المبيعات", callback_data="adm_recent_sales:0")],
+                [IKB("🔙 لوحة الأدمن", callback_data="adm_home")],
+            ])
+            await safe_edit_or_send(update, text, kb)
+            return
+
+        if data in ("adm_lookup_esim", "adm_lookup_user"):
+            await q.answer()
+            context.user_data["state"] = "ADM_LOOKUP_ESIM" if data == "adm_lookup_esim" else "ADM_LOOKUP_USER"
+            prompt = "أرسل رقم الشريحة مثل <code>#25</code>:" if data == "adm_lookup_esim" else "أرسل معرف العميل الرقمي أو اسم المستخدم مثل <code>@username</code>:"
+            await safe_edit_or_send(update, "🔍 <b>بحث الإدارة</b>\n━━━━━━━━━━━━━━━━━━━━\n"+prompt, InlineKeyboardMarkup([[IKB("🔙 إلغاء", callback_data="adm_inspector")]]))
+            return
+
+        if data.startswith("adm_recent_sales:"):
+            await q.answer()
+            clear_state(context)
+            page=int(data.split(":")[1]) if data.split(":")[1].isdigit() else 0
+            per=12
+            items,total=db.get_recent_sold_esims(per,page*per)
+            rows=[]
+            for e in items:
+                who=e.get("buyer_username") or e.get("buyer_full_name") or e.get("sold_to") or ""
+                rows.append([IKB(f"#{e['id']} | {e['country_name']} - {e['plan_name']} | {float(e['sold_price'] or 0):.2f} {currency} ({who})",callback_data=f"adm_esim_item:{e['id']}")])
+            pages=max(1,(total+per-1)//per)
+            if pages>1:
+                nav=[]
+                if page: nav.append(IKB("⬅️ السابق",callback_data=f"adm_recent_sales:{page-1}"))
+                nav.append(IKB(f"📄 {page+1}/{pages}",callback_data=f"adm_recent_sales:{page}"))
+                if page+1<pages: nav.append(IKB("التالي ➡️",callback_data=f"adm_recent_sales:{page+1}"))
+                rows.append(nav)
+            rows.append([IKB("🔙 مركز الفحص",callback_data="adm_inspector")])
+            text=f"🧾 <b>أحدث المبيعات ({total})</b>\n━━━━━━━━━━━━━━━━━━━━\nاضغط على عملية البيع لعرض تفاصيل الشريحة والمشتري."
+            await safe_edit_or_send(update,text,InlineKeyboardMarkup(rows))
+            return
+
+        if data.startswith("adm_user_view:"):
+            await q.answer()
+            clear_state(context)
+            target=db.find_user_admin(data.split(":")[1])
+            if not target:
+                await q.answer("⚠️ لم يتم العثور على العميل.",show_alert=True)
+                return
+            await render_admin_user_profile(update,target)
+            return
+
+        if data.startswith("adm_bal_user:"):
+            await q.answer()
+            uid=int(data.split(":")[1])
+            target=db.get_user(uid)
+            if not target: return
+            context.user_data["state"]="ADM_MANUAL_BAL_AMOUNT"
+            context.user_data["temp"]={"target_id":uid}
+            text=f"💰 <b>تعديل رصيد العميل #{uid}</b>\nالرصيد الحالي: <code>{float(target['balance']):.2f}</code> {html.escape(currency)}\nأرسل مبلغ الإضافة أو الخصم (مثال: <code>20</code> أو <code>-5</code>)."
+            await safe_edit_or_send(update,text,InlineKeyboardMarkup([[IKB("🔙 إلغاء",callback_data=f"adm_user_view:{uid}")]]))
+            return
+
+        if data.startswith("adm_toggle_ban_view:"):
+            uid=int(data.split(":")[1])
+            if uid==ADMIN_ID:
+                await q.answer("لا يمكن حظر مالك البوت.",show_alert=True); return
+            banned=not db.is_user_banned(uid)
+            db.set_user_ban(uid,banned)
+            await q.answer("تم تحديث حالة الحظر.",show_alert=True)
+            target=db.find_user_admin(str(uid))
+            if target: await render_admin_user_profile(update,target)
             return
 
         # ---------------- ADMIN: USERS & BAN MANAGEMENT ----------------
@@ -1617,23 +1994,23 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             stats = db.get_stats()
             banned_list = db.get_banned_users()
             rows = [
-                [IKB("\U0001f6ab \u062d\u0638\u0631 \u0645\u0633\u062a\u062e\u062f\u0645 \u0628\u0648\u0627\u0633\u0637\u0629 \u0627\u0644\u0640 ID", callback_data="adm_ban_input")],
-                [IKB("\u2705 \u0641\u0643 \u062d\u0638\u0631 \u0645\u0633\u062a\u062e\u062f\u0645 \u0628\u0648\u0627\u0633\u0637\u0629 \u0627\u0644\u0640 ID", callback_data="adm_unban_input")],
+                [IKB("🚫 حظر مستخدم بواسطة الـ ID", callback_data="adm_ban_input")],
+                [IKB("✅ فك حظر مستخدم بواسطة الـ ID", callback_data="adm_unban_input")],
             ]
             for b in banned_list[:15]:
                 rows.append([
                     IKB(
-                        f"\U0001f513 \u0641\u0643 \u062d\u0638\u0631: {b['full_name'] or b['user_id']} ({b['user_id']})",
+                        f"🔓 فك حظر: {b['full_name'] or b['user_id']} ({b['user_id']})",
                         callback_data=f"adm_unban_direct:{b['user_id']}",
                     )
                 ])
-            rows.append([IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")])
+            rows.append([IKB("🔙 لوحة تحكم الأدمن", callback_data="adm_home")])
             text = (
-                "\U0001f465 <b>\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u064a\u0646 \u0648\u0627\u0644\u062d\u0638\u0631</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                f"\U0001f464 <b>\u0625\u062c\u0645\u0627\u0644\u064a \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u064a\u0646:</b> {stats['total_users']}\n"
-                f"\U0001f6ab <b>\u0639\u062f\u062f \u0627\u0644\u0645\u062d\u0638\u0648\u0631\u064a\u0646 \u062d\u0627\u0644\u064a\u0627\u064b:</b> {stats['banned_users']}\n\n"
-                "\u064a\u0645\u0643\u0646\u0643 \u062d\u0638\u0631 \u0623\u0648 \u0641\u0643 \u062d\u0638\u0631 \u0623\u064a \u0645\u0633\u062a\u062e\u062f\u0645 \u0639\u0628\u0631 \u0627\u0644\u0640 ID \u0623\u0648 \u0627\u0644\u0636\u063a\u0637 \u0639\u0644\u0649 \u0627\u0633\u0645 \u0627\u0644\u0645\u062d\u0638\u0648\u0631 \u0628\u0627\u0644\u0623\u0633\u0641\u0644 \u0644\u0641\u0643 \u062d\u0638\u0631\u0647 \u0641\u0648\u0631\u0627\u064b:"
+                "👥 <b>إدارة المستخدمين والحظر</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>إجمالي المستخدمين:</b> {stats['total_users']}\n"
+                f"🚫 <b>عدد المحظورين حالياً:</b> {stats['banned_users']}\n\n"
+                "يمكنك حظر أو فك حظر أي مستخدم عبر الـ ID أو الضغط على اسم المحظور بالأسفل لفك حظره فوراً:"
             )
             await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
             return
@@ -1642,11 +2019,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.answer()
             context.user_data["state"] = "ADM_BAN_USER"
             text = (
-                "\U0001f6ab <b>\u062d\u0638\u0631 \u0645\u0633\u062a\u062e\u062f\u0645 \u0645\u0646 \u0627\u0644\u0628\u0648\u062a</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0645\u0639\u0631\u0641 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 (User ID)</b> \u0627\u0644\u0630\u064a \u062a\u0631\u064a\u062f \u062d\u0638\u0631\u0647 \u0646\u0647\u0627\u0626\u064a\u0627\u064b \u0645\u0646 \u0627\u0633\u062a\u062e\u062f\u0627\u0645 \u0627\u0644\u0628\u0648\u062a:"
+                "🚫 <b>حظر مستخدم من البوت</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "أرسل الآن <b>معرف المستخدم (User ID)</b> الذي تريد حظره نهائياً من استخدام البوت:"
             )
-            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_users_menu")]])
+            kb = InlineKeyboardMarkup([[IKB("🔙 إلغاء", callback_data="adm_users_menu")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1654,22 +2031,22 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.answer()
             context.user_data["state"] = "ADM_UNBAN_USER"
             text = (
-                "\u2705 <b>\u0641\u0643 \u062d\u0638\u0631 \u0645\u0633\u062a\u062e\u062f\u0645</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0645\u0639\u0631\u0641 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 (User ID)</b> \u0644\u0625\u0644\u063a\u0627\u0621 \u062d\u0638\u0631\u0647:"
+                "✅ <b>فك حظر مستخدم</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "أرسل الآن <b>معرف المستخدم (User ID)</b> لإلغاء حظره:"
             )
-            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_users_menu")]])
+            kb = InlineKeyboardMarkup([[IKB("🔙 إلغاء", callback_data="adm_users_menu")]])
             await safe_edit_or_send(update, text, kb)
             return
 
         if data.startswith("adm_unban_direct:"):
             target_id = int(data.split(":")[1])
             db.set_user_ban(target_id, False)
-            await q.answer(f"\u2705 \u062a\u0645 \u0641\u0643 \u0627\u0644\u062d\u0638\u0631 \u0639\u0646 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 {target_id}", show_alert=True)
+            await q.answer(f"✅ تم فك الحظر عن المستخدم {target_id}", show_alert=True)
             try:
                 await context.bot.send_message(
                     chat_id=target_id,
-                    text="\u2705 <b>\u062a\u0645 \u0631\u0641\u0639 \u0627\u0644\u062d\u0638\u0631 \u0639\u0646 \u062d\u0633\u0627\u0628\u0643! \u064a\u0645\u0643\u0646\u0643 \u0627\u0644\u0622\u0646 \u0627\u0633\u062a\u062e\u062f\u0627\u0645 \u0627\u0644\u0628\u0648\u062a \u0628\u0634\u0643\u0644 \u0637\u0628\u064a\u0639\u064a.</b>",
+                    text="✅ <b>تم رفع الحظر عن حسابك! يمكنك الآن استخدام البوت بشكل طبيعي.</b>",
                     parse_mode=ParseMode.HTML,
                 )
             except TelegramError:
@@ -1682,11 +2059,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.answer()
             context.user_data["state"] = "ADM_BROADCAST_MSG"
             text = (
-                "\U0001f4e2 <b>\u0625\u0631\u0633\u0627\u0644 \u0631\u0633\u0627\u0644\u0629 \u062c\u0645\u0627\u0639\u064a\u0629 \u0639\u0627\u0645\u0629 \u0644\u062c\u0645\u064a\u0639 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u064a\u0646</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0627\u0644\u0631\u0633\u0627\u0644\u0629 \u0627\u0644\u0646\u0635\u064a\u0629</b> \u0623\u0648 <b>\u0627\u0644\u0635\u0648\u0631\u0629 \u0645\u0639 \u0627\u0644\u0648\u0635\u0641</b> \u0627\u0644\u062a\u064a \u062a\u0631\u064a\u062f \u0625\u0631\u0633\u0627\u0644\u0647\u0627 \u0644\u062c\u0645\u064a\u0639 \u0645\u0633\u062a\u062e\u062f\u0645\u064a \u0627\u0644\u0628\u0648\u062a:"
+                "📢 <b>إرسال رسالة جماعية عامة لجميع المستخدمين</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "أرسل الآن <b>الرسالة النصية</b> أو <b>الصورة مع الوصف</b> التي تريد إرسالها لجميع مستخدمي البوت:"
             )
-            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_home")]])
+            kb = InlineKeyboardMarkup([[IKB("🔙 إلغاء", callback_data="adm_home")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1694,26 +2071,26 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if data == "adm_settings":
             await q.answer()
             clear_state(context)
-            binance_id = db.get_setting("binance_id", "\u063a\u064a\u0631 \u0645\u062d\u062f\u062f")
-            instapay = db.get_setting("instapay_address", "\u063a\u064a\u0631 \u0645\u062d\u062f\u062f")
+            binance_id = db.get_setting("binance_id", "غير محدد")
+            instapay = db.get_setting("instapay_address", "غير محدد")
             support = db.get_setting("support_username", "Support")
             curr = db.get_setting("currency", "USD")
 
             text = (
-                "\u2699\ufe0f <b>\u0625\u0639\u062f\u0627\u062f\u0627\u062a \u0627\u0644\u062f\u0641\u0639 \u0648\u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                f"\U0001f7e1 <b>\u0645\u0639\u0631\u0641 Binance ID:</b> <code>{html.escape(binance_id)}</code>\n"
-                f"\U0001f7e3 <b>\u0639\u0646\u0648\u0627\u0646 InstaPay EG:</b> <code>{html.escape(instapay)}</code>\n"
-                f"\U0001f6df <b>\u064a\u0648\u0632\u0631 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a:</b> @{html.escape(support.lstrip('@'))}\n"
-                f"\U0001f4b5 <b>\u0639\u0645\u0644\u0629 \u0627\u0644\u0645\u062a\u062c\u0631:</b> <code>{html.escape(curr)}</code>\n\n"
-                "\U0001f447 \u0627\u0636\u063a\u0637 \u0639\u0644\u0649 \u0623\u064a \u0625\u0639\u062f\u0627\u062f \u0644\u062a\u0639\u062f\u064a\u0644\u0647 \u0645\u0628\u0627\u0634\u0631\u0629:"
+                "⚙️ <b>إعدادات الدفع والدعم الفني</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"🟡 <b>معرف Binance ID:</b> <code>{html.escape(binance_id)}</code>\n"
+                f"🟣 <b>عنوان InstaPay EG:</b> <code>{html.escape(instapay)}</code>\n"
+                f"🛟 <b>يوزر الدعم الفني:</b> @{html.escape(support.lstrip('@'))}\n"
+                f"💵 <b>عملة المتجر:</b> <code>{html.escape(curr)}</code>\n\n"
+                "👇 اضغط على أي إعداد لتعديله مباشرة:"
             )
             kb = InlineKeyboardMarkup([
-                [IKB("\U0001f7e1 \u062a\u0639\u062f\u064a\u0644 \u0645\u0639\u0631\u0641 Binance ID", callback_data="adm_set_key:binance_id")],
-                [IKB("\U0001f7e3 \u062a\u0639\u062f\u064a\u0644 \u0639\u0646\u0648\u0627\u0646 InstaPay EG", callback_data="adm_set_key:instapay_address")],
-                [IKB("\U0001f6df \u062a\u0639\u062f\u064a\u0644 \u064a\u0648\u0632\u0631 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a", callback_data="adm_set_key:support_username")],
-                [IKB("\U0001f4b5 \u062a\u0639\u062f\u064a\u0644 \u0631\u0645\u0632 \u0627\u0644\u0639\u0645\u0644\u0629 (USD / EGP)", callback_data="adm_set_key:currency")],
-                [IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")],
+                [IKB("🟡 تعديل معرف Binance ID", callback_data="adm_set_key:binance_id")],
+                [IKB("🟣 تعديل عنوان InstaPay EG", callback_data="adm_set_key:instapay_address")],
+                [IKB("🛟 تعديل يوزر الدعم الفني", callback_data="adm_set_key:support_username")],
+                [IKB("💵 تعديل رمز العملة (USD / EGP)", callback_data="adm_set_key:currency")],
+                [IKB("🔙 لوحة تحكم الأدمن", callback_data="adm_home")],
             ])
             await safe_edit_or_send(update, text, kb)
             return
@@ -1722,19 +2099,19 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.answer()
             key = data.split(":")[1]
             labels = {
-                "binance_id": "\u0645\u0639\u0631\u0641 Binance ID \u0627\u0644\u062c\u062f\u064a\u062f",
-                "instapay_address": "\u0639\u0646\u0648\u0627\u0646 \u0623\u0648 \u0631\u0642\u0645 InstaPay EG \u0627\u0644\u062c\u062f\u064a\u062f",
-                "support_username": "\u064a\u0648\u0632\u0631 \u0627\u0644\u062f\u0639\u0645 \u0627\u0644\u0641\u0646\u064a \u0641\u064a \u062a\u064a\u0644\u064a\u062c\u0631\u0627\u0645 (\u0628\u062f\u0648\u0646 @)",
-                "currency": "\u0631\u0645\u0632 \u0627\u0644\u0639\u0645\u0644\u0629 (\u0645\u062b\u0627\u0644: USD \u0623\u0648 \u062c.\u0645)",
+                "binance_id": "معرف Binance ID الجديد",
+                "instapay_address": "عنوان أو رقم InstaPay EG الجديد",
+                "support_username": "يوزر الدعم الفني في تيليجرام (بدون @)",
+                "currency": "رمز العملة (مثال: USD أو ج.م)",
             }
             context.user_data["state"] = "ADM_SET_SETTING"
             context.user_data["temp"] = {"key": key}
             text = (
-                f"\u2699\ufe0f <b>\u062a\u062d\u062f\u064a\u062b \u0627\u0644\u0625\u0639\u062f\u0627\u062f: {labels.get(key, key)}</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u0623\u0631\u0633\u0644 \u0627\u0644\u0642\u064a\u0645\u0629 \u0627\u0644\u062c\u062f\u064a\u062f\u0629 \u0627\u0644\u0622\u0646:"
+                f"⚙️ <b>تحديث الإعداد: {labels.get(key, key)}</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "أرسل القيمة الجديدة الآن:"
             )
-            kb = InlineKeyboardMarkup([[IKB("\U0001f519 \u0625\u0644\u063a\u0627\u0621", callback_data="adm_settings")]])
+            kb = InlineKeyboardMarkup([[IKB("🔙 إلغاء", callback_data="adm_settings")]])
             await safe_edit_or_send(update, text, kb)
             return
 
@@ -1750,7 +2127,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not msg or not user:
         return
 
-    db.upsert_user(user.id, user.username, user.full_name)
+    ensure_user_synced(user, context)
     state = context.user_data.get("state")
     temp = context.user_data.get("temp", {})
     currency = get_currency()
@@ -1777,14 +2154,14 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # --------------------------------------------------------------------------
     if state == "USER_TOPUP_AMOUNT":
         if not msg.text:
-            await msg.reply_text("\u26a0\ufe0f \u064a\u0631\u062c\u0649 \u0625\u0631\u0633\u0627\u0644 \u0642\u064a\u0645\u0629 \u0627\u0644\u0645\u0628\u0644\u063a \u0643\u0623\u0631\u0642\u0627\u0645 \u0641\u0642\u0637 (\u0645\u062b\u0627\u0644: 15).")
+            await msg.reply_text("⚠️ يرجى إرسال قيمة المبلغ كأرقام فقط (مثال: 15).")
             return
         try:
             amount = round(float(msg.text.strip().replace(",", ".")), 2)
             if amount <= 0:
                 raise ValueError()
         except ValueError:
-            await msg.reply_text("\u26a0\ufe0f \u0642\u064a\u0645\u0629 \u063a\u064a\u0631 \u0635\u062d\u064a\u062d\u0629! \u064a\u0631\u062c\u0649 \u0625\u062f\u062e\u0627\u0644 \u0631\u0642\u0645 \u0623\u0643\u0628\u0631 \u0645\u0646 \u0635\u0641\u0631 (\u0645\u062b\u0627\u0644: <code>10</code>).", parse_mode=ParseMode.HTML)
+            await msg.reply_text("⚠️ قيمة غير صحيحة! يرجى إدخال رقم أكبر من صفر (مثال: <code>10</code>).", parse_mode=ParseMode.HTML)
             return
 
         temp["amount"] = amount
@@ -1792,11 +2169,11 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["state"] = "USER_TOPUP_PROOF"
 
         await msg.reply_text(
-            f"\u2705 <b>\u0627\u0644\u0645\u0628\u0644\u063a \u0627\u0644\u0645\u062d\u062f\u062f \u0644\u0644\u0634\u062d\u0646:</b> <code>{amount:.2f}</code> {html.escape(currency)}\n\n"
-            "\U0001f4f8 <b>\u0627\u0644\u062e\u0637\u0648\u0629 \u0627\u0644\u0623\u062e\u064a\u0631\u0629:</b>\n"
-            "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0635\u0648\u0631\u0629 \u0625\u064a\u0635\u0627\u0644 \u0627\u0644\u062a\u062d\u0648\u064a\u0644 (Screenshot)</b> \u0623\u0648 \u0623\u0631\u0633\u0644 <b>\u0631\u0642\u0645 \u0627\u0644\u0639\u0645\u0644\u064a\u0629 \u0627\u0644\u0645\u0631\u062c\u0639\u064a (Transaction ID / \u0627\u0633\u0645 \u0627\u0644\u0645\u062d\u0648\u0644)</b> \u0641\u064a \u0631\u0633\u0627\u0644\u0629:",
+            f"✅ <b>المبلغ المحدد للشحن:</b> <code>{amount:.2f}</code> {html.escape(currency)}\n\n"
+            "📸 <b>الخطوة الأخيرة:</b>\n"
+            "أرسل الآن <b>صورة إيصال التحويل (Screenshot)</b> أو أرسل <b>رقم العملية المرجعي (Transaction ID / اسم المحول)</b> في رسالة:",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f3e0 \u0625\u0644\u063a\u0627\u0621", callback_data="home")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("🏠 إلغاء", callback_data="home")]]),
         )
         return
 
@@ -1811,7 +2188,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             proof_file_id = msg.document.file_id
 
         if not proof_text and not proof_file_id:
-            await msg.reply_text("\u26a0\ufe0f \u064a\u0631\u062c\u0649 \u0625\u0631\u0633\u0627\u0644 \u0635\u0648\u0631\u0629 \u0625\u064a\u0635\u0627\u0644 \u0627\u0644\u062a\u062d\u0648\u064a\u0644 \u0623\u0648 \u0643\u062a\u0627\u0628\u0629 \u0631\u0642\u0645 \u0627\u0644\u0639\u0645\u0644\u064a\u0629 \u0627\u0644\u0645\u0631\u062c\u0639\u064a.")
+            await msg.reply_text("⚠️ يرجى إرسال صورة إيصال التحويل أو كتابة رقم العملية المرجعي.")
             return
 
         req_id = db.create_topup_request(
@@ -1824,30 +2201,30 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         clear_state(context)
 
         await msg.reply_text(
-            f"\u2705 <b>\u062a\u0645 \u0625\u0631\u0633\u0627\u0644 \u0637\u0644\u0628 \u0634\u062d\u0646 \u0627\u0644\u0631\u0635\u064a\u062f \u0631\u0642\u0645 #{req_id} \u0628\u0646\u062c\u0627\u062d!</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            f"\U0001f4b5 <b>\u0627\u0644\u0645\u0628\u0644\u063a:</b> {amount:.2f} {html.escape(currency)}\n"
-            "\u23f3 \u062c\u0627\u0631\u064a \u0645\u0631\u0627\u062c\u0639\u0629 \u0627\u0644\u062a\u062d\u0648\u064a\u0644 \u0645\u0646 \u0642\u0650\u0628\u0644 \u0627\u0644\u0625\u062f\u0627\u0631\u0629\u060c \u0648\u0633\u064a\u0635\u0644 \u0625\u0644\u064a\u0643 \u0625\u0634\u0639\u0627\u0631 \u0641\u0648\u0631 \u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u0631\u0635\u064a\u062f \u0644\u062d\u0633\u0627\u0628\u0643.",
+            f"✅ <b>تم إرسال طلب شحن الرصيد رقم #{req_id} بنجاح!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"💵 <b>المبلغ:</b> {amount:.2f} {html.escape(currency)}\n"
+            "⏳ جاري مراجعة التحويل من قِبل الإدارة، وسيصل إليك إشعار فور إضافة الرصيد لحسابك.",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("🏠 القائمة الرئيسية", callback_data="home")]]),
         )
 
         # Notify Admin immediately
         if ADMIN_ID:
-            m_label = "\U0001f7e1 Binance Pay" if method == "binance" else "\U0001f7e3 InstaPay EG"
+            m_label = "🟡 Binance Pay" if method == "binance" else "🟣 InstaPay EG"
             adm_caption = (
-                f"\U0001f514 <b>\u0637\u0644\u0628 \u0634\u062d\u0646 \u0631\u0635\u064a\u062f \u062c\u062f\u064a\u062f #{req_id}</b>\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                f"\U0001f464 <b>\u0627\u0644\u0639\u0645\u064a\u0644:</b> {html.escape(user.full_name or '')} (@{html.escape(user.username or NO_USER)})\n"
-                f"\U0001f194 <b>\u0645\u0639\u0631\u0641 \u0627\u0644\u0639\u0645\u064a\u0644:</b> <code>{user.id}</code>\n"
-                f"\U0001f4b3 <b>\u0637\u0631\u064a\u0642\u0629 \u0627\u0644\u062f\u0641\u0639:</b> {m_label}\n"
-                f"\U0001f4b5 <b>\u0627\u0644\u0645\u0628\u0644\u063a:</b> <code>{amount:.2f}</code> {html.escape(currency)}\n"
-                f"\U0001f4dd <b>\u0627\u0644\u062a\u0641\u0627\u0635\u064a\u0644/\u0627\u0644\u0645\u0631\u062c\u0639:</b> {html.escape(proof_text or ATTACHED_RECEIPT)}"
+                f"🔔 <b>طلب شحن رصيد جديد #{req_id}</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>العميل:</b> {html.escape(user.full_name or '')} (@{html.escape(user.username or NO_USER)})\n"
+                f"🆔 <b>معرف العميل:</b> <code>{user.id}</code>\n"
+                f"💳 <b>طريقة الدفع:</b> {m_label}\n"
+                f"💵 <b>المبلغ:</b> <code>{amount:.2f}</code> {html.escape(currency)}\n"
+                f"📝 <b>التفاصيل/المرجع:</b> {html.escape(proof_text or ATTACHED_RECEIPT)}"
             )
             adm_kb = InlineKeyboardMarkup([
                 [
-                    IKB("\u2705 \u0642\u0628\u0648\u0644 \u0648\u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u0631\u0635\u064a\u062f", callback_data=f"adm_topup_ok:{req_id}"),
-                    IKB("\u274c \u0631\u0641\u0636 \u0627\u0644\u0637\u0644\u0628", callback_data=f"adm_topup_no:{req_id}"),
+                    IKB("✅ قبول وإضافة الرصيد", callback_data=f"adm_topup_ok:{req_id}"),
+                    IKB("❌ رفض الطلب", callback_data=f"adm_topup_no:{req_id}"),
                 ]
             ])
             try:
@@ -1875,19 +2252,19 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # --------------------------------------------------------------------------
     if state == "USER_REFUND_REASON":
         if not msg.text:
-            await msg.reply_text("\u26a0\ufe0f \u064a\u0631\u062c\u0649 \u0643\u062a\u0627\u0628\u0629 \u0648\u0635\u0641 \u0645\u062e\u062a\u0635\u0631 \u0644\u0644\u0645\u0634\u0643\u0644\u0629 \u0643\u0646\u0635.")
+            await msg.reply_text("⚠️ يرجى كتابة وصف مختصر للمشكلة كنص.")
             return
         temp["reason"] = msg.text.strip()
         context.user_data["temp"] = temp
         context.user_data["state"] = "USER_REFUND_VIDEO"
         await msg.reply_text(
-            "\u2705 <b>\u062a\u0645 \u062a\u0633\u062c\u064a\u0644 \u0648\u0635\u0641 \u0627\u0644\u0645\u0634\u0643\u0644\u0629.</b>\n\n"
-            "2\ufe0f\u20e3 <b>\u0627\u0644\u062e\u0637\u0648\u0629 \u0627\u0644\u0623\u062e\u064a\u0631\u0629 (\u0625\u0644\u062a\u0627\u0645\u064a\u0629):</b>\n"
-            "\U0001f3ac \u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0641\u064a\u062f\u064a\u0648 \u0625\u062b\u0628\u0627\u062a \u064a\u0648\u0636\u062d \u0643\u0627\u0641\u0629 \u062a\u0641\u0627\u0635\u064a\u0644 \u0627\u0644\u0645\u0634\u0643\u0644\u0629</b> "
-            "(\u0645\u062b\u0644: \u062a\u0633\u062c\u064a\u0644 \u0634\u0627\u0634\u0629 \u064a\u0638\u0647\u0631 \u0641\u064a\u0647 \u0643\u0648\u062f \u0627\u0644\u0640 QR \u0648\u0631\u0633\u0627\u0644\u0629 \u0627\u0644\u062e\u0637\u0623 \u0639\u0646\u062f \u0627\u0644\u062a\u0641\u0639\u064a\u0644).\n"
-            "\u26a0\ufe0f <b>\u0644\u0646 \u064a\u062a\u0645 \u0642\u0628\u0648\u0644 \u0627\u0644\u0637\u0644\u0628 \u0628\u062f\u0648\u0646 \u0641\u064a\u062f\u064a\u0648.</b>",
+            "✅ <b>تم تسجيل وصف المشكلة.</b>\n\n"
+            "2️⃣ <b>الخطوة الأخيرة (إلزامية):</b>\n"
+            "🎬 أرسل الآن <b>فيديو إثبات يوضح كافة تفاصيل المشكلة</b> "
+            "(مثل: تسجيل شاشة يظهر فيه كود الـ QR ورسالة الخطأ عند التفعيل).\n"
+            "⚠️ <b>لن يتم قبول الطلب بدون فيديو.</b>",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f3e0 \u0625\u0644\u063a\u0627\u0621 \u0648\u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("🏠 إلغاء والعودة للرئيسية", callback_data="home")]]),
         )
         return
 
@@ -1906,8 +2283,8 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         if not video_file_id:
             await msg.reply_text(
-                "\u26a0\ufe0f <b>\u064a\u062c\u0628 \u0625\u0631\u0633\u0627\u0644 \u0641\u064a\u062f\u064a\u0648 \u0625\u062b\u0628\u0627\u062a \u0644\u0644\u0645\u0634\u0643\u0644\u0629.</b>\n"
-                "\u0627\u0644\u0635\u0648\u0631 \u0623\u0648 \u0627\u0644\u0631\u0633\u0627\u0626\u0644 \u0627\u0644\u0646\u0635\u064a\u0629 \u0648\u062d\u062f\u0647\u0627 \u063a\u064a\u0631 \u0643\u0627\u0641\u064a\u0629. \u064a\u0631\u062c\u0649 \u0625\u0631\u0633\u0627\u0644 \u0641\u064a\u062f\u064a\u0648 \u064a\u0648\u0636\u062d \u0643\u0627\u0641\u0629 \u062a\u0641\u0627\u0635\u064a\u0644 \u0627\u0644\u0645\u0634\u0643\u0644\u0629:",
+                "⚠️ <b>يجب إرسال فيديو إثبات للمشكلة.</b>\n"
+                "الصور أو الرسائل النصية وحدها غير كافية. يرجى إرسال فيديو يوضح كافة تفاصيل المشكلة:",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -1916,7 +2293,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         esim = db.get_esim(esim_id)
         if not esim or esim.get("sold_to") != user.id:
             clear_state(context)
-            await msg.reply_text("\u26a0\ufe0f \u062a\u0639\u0630\u0631 \u0627\u0644\u0639\u062b\u0648\u0631 \u0639\u0644\u0649 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0627\u0644\u0645\u062e\u062a\u0627\u0631\u0629. \u062a\u0645 \u0625\u0644\u063a\u0627\u0621 \u0627\u0644\u0637\u0644\u0628.")
+            await msg.reply_text("⚠️ تعذر العثور على الشريحة المختارة. تم إلغاء الطلب.")
             return
 
         req_id = db.create_refund_request(
@@ -1931,19 +2308,19 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         if req_id is None:
             await msg.reply_text(
-                "\u26a0\ufe0f <b>\u064a\u0648\u062c\u062f \u0628\u0627\u0644\u0641\u0639\u0644 \u0637\u0644\u0628 \u0627\u0633\u062a\u0631\u062f\u0627\u062f \u0644\u0647\u0630\u0647 \u0627\u0644\u0634\u0631\u064a\u062d\u0629.</b>",
+                "⚠️ <b>يوجد بالفعل طلب استرداد لهذه الشريحة.</b>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[IKB("\U0001f3e0 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629", callback_data="home")]]),
+                reply_markup=InlineKeyboardMarkup([[IKB("🏠 القائمة الرئيسية", callback_data="home")]]),
             )
             return
 
         await msg.reply_text(
-            f"\u2705 <b>\u062a\u0645 \u0625\u0631\u0633\u0627\u0644 \u0637\u0644\u0628 \u0627\u0644\u0627\u0633\u062a\u0631\u062f\u0627\u062f \u0631\u0642\u0645 #{req_id} \u0628\u0646\u062c\u0627\u062d!</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            f"\U0001f4f2 <b>\u0627\u0644\u0634\u0631\u064a\u062d\u0629:</b> #{esim_id} ({html.escape(esim['country_name'])} - {html.escape(esim['plan_name'])})\n"
-            f"\U0001f4b5 <b>\u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u0645\u062f\u0641\u0648\u0639:</b> {float(esim.get('sold_price') or 0):.2f} {html.escape(currency)}\n"
-            "\U0001f3ac <b>\u062a\u0645 \u0625\u0631\u0633\u0627\u0644 \u0641\u064a\u062f\u064a\u0648 \u0627\u0644\u0625\u062b\u0628\u0627\u062a \u0625\u0644\u0649 \u0627\u0644\u0625\u062f\u0627\u0631\u0629.</b>\n"
-            "\u23f3 \u0637\u0644\u0628\u0643 \u0642\u064a\u062f \u0627\u0644\u0645\u0631\u0627\u062c\u0639\u0629 \u0644\u062f\u0649 \u0627\u0644\u0625\u062f\u0627\u0631\u0629\u060c \u0648\u0633\u064a\u062a\u0645 \u0625\u0634\u0639\u0627\u0631\u0643 \u0641\u0648\u0631 \u0627\u0643\u062a\u0645\u0627\u0644 \u0627\u0644\u0645\u0631\u0627\u062c\u0639\u0629.",
+            f"✅ <b>تم إرسال طلب الاسترداد رقم #{req_id} بنجاح!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━\n"
+            f"📲 <b>الشريحة:</b> #{esim_id} ({html.escape(esim['country_name'])} - {html.escape(esim['plan_name'])})\n"
+            f"💵 <b>السعر المدفوع:</b> {float(esim.get('sold_price') or 0):.2f} {html.escape(currency)}\n"
+            "🎬 <b>تم إرسال فيديو الإثبات إلى الإدارة.</b>\n"
+            "⏳ طلبك قيد المراجعة لدى الإدارة، وسيتم إشعارك فور اكتمال المراجعة.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[IKB("🏠 القائمة الرئيسية", callback_data="home")]]),
         )
@@ -1967,22 +2344,22 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if state == "ADM_ADD_COUNTRY":
         if not msg.text:
-            await msg.reply_text("\u26a0\ufe0f \u064a\u0631\u062c\u0649 \u0625\u0631\u0633\u0627\u0644 \u0627\u0633\u0645 \u0627\u0644\u062f\u0648\u0644\u0629 \u0643\u0646\u0635.")
+            await msg.reply_text("⚠️ يرجى إرسال اسم الدولة كنص.")
             return
         cid = db.add_country(msg.text.strip())
         clear_state(context)
         if not cid:
             await msg.reply_text(
-                "\u26a0\ufe0f \u0647\u0630\u0647 \u0627\u0644\u062f\u0648\u0644\u0629 \u0645\u0648\u062c\u0648\u062f\u0629 \u0628\u0627\u0644\u0641\u0639\u0644!",
-                reply_markup=InlineKeyboardMarkup([[IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u062f\u0648\u0644", callback_data="adm_countries")]]),
+                "⚠️ هذه الدولة موجودة بالفعل!",
+                reply_markup=InlineKeyboardMarkup([[IKB("🔙 العودة للدول", callback_data="adm_countries")]]),
             )
             return
         await msg.reply_text(
-            f"\u2705 <b>\u062a\u0645\u062a \u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u062f\u0648\u0644\u0629 ({html.escape(msg.text.strip())}) \u0628\u0646\u062c\u0627\u062d!</b>",
+            f"✅ <b>تمت إضافة الدولة ({html.escape(msg.text.strip())}) بنجاح!</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0628\u0627\u0642\u0629 \u0644\u0647\u0630\u0647 \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plan_add:{cid}")],
-                [IKB("\U0001f30d \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062f\u0648\u0644", callback_data="adm_countries")],
+                [IKB("➕ إضافة باقة لهذه الدولة", callback_data=f"adm_plan_add:{cid}")],
+                [IKB("🌍 العودة لقائمة الدول", callback_data="adm_countries")],
             ]),
         )
         return
@@ -1994,9 +2371,9 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ok = db.update_country(country_id, msg.text.strip())
         clear_state(context)
         await msg.reply_text(
-            "\u2705 <b>\u062a\u0645 \u062a\u062d\u062f\u064a\u062b \u0627\u0633\u0645 \u0627\u0644\u062f\u0648\u0644\u0629 \u0628\u0646\u062c\u0627\u062d!</b>" if ok else "\u26a0\ufe0f \u062a\u0639\u0630\u0631 \u062a\u062d\u062f\u064a\u062b \u0627\u0644\u0627\u0633\u0645.",
+            "✅ <b>تم تحديث اسم الدولة بنجاح!</b>" if ok else "⚠️ تعذر تحديث الاسم.",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_country_view:{country_id}")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("🔙 العودة للدولة", callback_data=f"adm_country_view:{country_id}")]]),
         )
         return
 
@@ -2007,8 +2384,8 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["temp"] = temp
         context.user_data["state"] = "ADM_ADD_PLAN_DESC"
         await msg.reply_text(
-            "\U0001f4dd <b>\u0625\u0636\u0627\u0641\u0629 \u0628\u0627\u0642\u0629 \u062c\u062f\u064a\u062f\u0629 (\u0627\u0644\u062e\u0637\u0648\u0629 2 \u0645\u0646 3)</b>\n"
-            "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0648\u0635\u0641 \u0648\u062a\u0641\u0627\u0635\u064a\u0644 \u0627\u0644\u0628\u0627\u0642\u0629</b> (\u0645\u062b\u0627\u0644: <code>\u0635\u0644\u0627\u062d\u064a\u0629 30 \u064a\u0648\u0645 - \u062a\u062f\u0639\u0645 \u0627\u0644\u062c\u064a\u0644 \u0627\u0644\u062e\u0627\u0645\u0633 5G - \u0642\u0627\u0628\u0644\u0629 \u0644\u0646\u0642\u0637\u0629 \u0627\u0644\u0627\u062a\u0635\u0627\u0644</code>) \u0623\u0648 \u0623\u0631\u0633\u0644 \u0646\u0642\u0637\u0629 <code>.</code> \u0644\u062a\u062e\u0637\u064a \u0627\u0644\u0648\u0635\u0641:",
+            "📝 <b>إضافة باقة جديدة (الخطوة 2 من 3)</b>\n"
+            "أرسل الآن <b>وصف وتفاصيل الباقة</b> (مثال: <code>صلاحية 30 يوم - تدعم الجيل الخامس 5G - قابلة لنقطة الاتصال</code>) أو أرسل نقطة <code>.</code> لتخطي الوصف:",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -2021,8 +2398,8 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["temp"] = temp
         context.user_data["state"] = "ADM_ADD_PLAN_PRICE"
         await msg.reply_text(
-            f"\U0001f4b5 <b>\u0625\u0636\u0627\u0641\u0629 \u0628\u0627\u0642\u0629 \u062c\u062f\u064a\u062f\u0629 (\u0627\u0644\u062e\u0637\u0648\u0629 3 \u0645\u0646 3)</b>\n"
-            f"\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0633\u0639\u0631 \u0627\u0644\u0628\u0627\u0642\u0629 ({html.escape(currency)})</b> \u0643\u0623\u0631\u0642\u0627\u0645 \u0641\u0642\u0637 (\u0645\u062b\u0627\u0644: <code>12.5</code>):",
+            f"💵 <b>إضافة باقة جديدة (الخطوة 3 من 3)</b>\n"
+            f"أرسل الآن <b>سعر الباقة ({html.escape(currency)})</b> كأرقام فقط (مثال: <code>12.5</code>):",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -2035,17 +2412,17 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if price < 0:
                 raise ValueError()
         except ValueError:
-            await msg.reply_text("\u26a0\ufe0f \u064a\u0631\u062c\u0649 \u0625\u062f\u062e\u0627\u0644 \u0633\u0639\u0631 \u0631\u0642\u0645\u064a \u0635\u062d\u064a\u062d (\u0645\u062b\u0627\u0644: 10 \u0623\u0648 14.99).")
+            await msg.reply_text("⚠️ يرجى إدخال سعر رقمي صحيح (مثال: 10 أو 14.99).")
             return
         country_id = int(temp["country_id"])
         plan_id = db.add_plan(country_id, temp["name"], temp.get("description", ""), price)
         clear_state(context)
         await msg.reply_text(
-            f"\u2705 <b>\u062a\u0645\u062a \u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u0628\u0627\u0642\u0629 ({html.escape(temp['name'])}) \u0628\u0633\u0639\u0631 {price:.2f} {html.escape(currency)} \u0628\u0646\u062c\u0627\u062d!</b>",
+            f"✅ <b>تمت إضافة الباقة ({html.escape(temp['name'])}) بسعر {price:.2f} {html.escape(currency)} بنجاح!</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0634\u0631\u0627\u0626\u062d eSIM \u0644\u0647\u0630\u0647 \u0627\u0644\u0628\u0627\u0642\u0629 \u0627\u0644\u0622\u0646", callback_data=f"adm_esim_add:{plan_id}")],
-                [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0628\u0627\u0642\u0627\u062a \u0627\u0644\u062f\u0648\u0644\u0629", callback_data=f"adm_plans_country:{country_id}")],
+                [IKB("➕ إضافة شرائح eSIM لهذه الباقة الآن", callback_data=f"adm_esim_add:{plan_id}")],
+                [IKB("🔙 العودة لباقات الدولة", callback_data=f"adm_plans_country:{country_id}")],
             ]),
         )
         return
@@ -2062,7 +2439,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["temp"] = temp
         context.user_data["state"] = "ADM_EDIT_PLAN_DESC"
         await msg.reply_text(
-            "\U0001f4dd \u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0627\u0644\u0648\u0635\u0641 \u0627\u0644\u062c\u062f\u064a\u062f \u0644\u0644\u0628\u0627\u0642\u0629</b> (\u0623\u0648 \u0623\u0631\u0633\u0644 \u0646\u0642\u0637\u0629 <code>.</code> \u0644\u0644\u0625\u0628\u0642\u0627\u0621 \u0639\u0644\u0649 \u0627\u0644\u0648\u0635\u0641 \u0627\u0644\u062d\u0627\u0644\u064a):",
+            "📝 أرسل الآن <b>الوصف الجديد للباقة</b> (أو أرسل نقطة <code>.</code> للإبقاء على الوصف الحالي):",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -2079,7 +2456,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["temp"] = temp
         context.user_data["state"] = "ADM_EDIT_PLAN_PRICE"
         await msg.reply_text(
-            f"\U0001f4b5 \u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u062c\u062f\u064a\u062f \u0644\u0644\u0628\u0627\u0642\u0629 ({html.escape(currency)})</b> (\u0623\u0648 \u0623\u0631\u0633\u0644 \u0646\u0642\u0637\u0629 <code>.</code> \u0644\u0644\u0625\u0628\u0642\u0627\u0621 \u0639\u0644\u0649 \u0627\u0644\u0633\u0639\u0631 \u0627\u0644\u062d\u0627\u0644\u064a {float(plan['price']):.2f}):",
+            f"💵 أرسل الآن <b>السعر الجديد للباقة ({html.escape(currency)})</b> (أو أرسل نقطة <code>.</code> للإبقاء على السعر الحالي {float(plan['price']):.2f}):",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -2100,14 +2477,14 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 if price < 0:
                     raise ValueError()
             except ValueError:
-                await msg.reply_text("\u26a0\ufe0f \u064a\u0631\u062c\u0649 \u0625\u062f\u062e\u0627\u0644 \u0633\u0639\u0631 \u0631\u0642\u0645\u064a \u0635\u062d\u064a\u062d.")
+                await msg.reply_text("⚠️ يرجى إدخال سعر رقمي صحيح.")
                 return
         db.update_plan(plan_id, temp["name"], temp["description"], price)
         clear_state(context)
         await msg.reply_text(
-            "\u2705 <b>\u062a\u0645 \u062a\u062d\u062f\u064a\u062b \u0628\u064a\u0627\u0646\u0627\u062a \u0627\u0644\u0628\u0627\u0642\u0629 \u0628\u0646\u062c\u0627\u062d!</b>",
+            "✅ <b>تم تحديث بيانات الباقة بنجاح!</b>",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_view:{plan_id}")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("🔙 العودة للباقة", callback_data=f"adm_plan_view:{plan_id}")]]),
         )
         return
 
@@ -2116,62 +2493,48 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # --------------------------------------------------------------------------
     if state == "ADM_ADD_ESIM":
         plan_id = int(temp["plan_id"])
+        mode = temp.get("notify_mode", "all")
         plan = db.get_plan(plan_id)
         if not plan:
             clear_state(context)
             return
-
-        added_count = 0
-        # Case 1: Admin sent QR Photo or Image Document
+        added = skipped = 0
         if msg.photo or (msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image/")):
             file_id = msg.photo[-1].file_id if msg.photo else msg.document.file_id
             tg_file = await context.bot.get_file(file_id)
             local_path = str(QR_DIR / f"qr_plan{plan_id}_{file_id[:12]}.png")
             await tg_file.download_to_drive(custom_path=local_path)
-            caption_str = (msg.caption or "").strip()
-            lpa_in_caption = caption_str if caption_str.upper().startswith("LPA:") else ""
-            notes_in_caption = "" if lpa_in_caption else caption_str
-
-            db.add_esim(
-                plan_id=plan_id,
-                item_type="qr",
-                lpa_code=lpa_in_caption,
-                qr_file_id=file_id,
-                qr_local_path=local_path,
-                notes=notes_in_caption,
-            )
-            added_count = 1
-
-        # Case 2: Admin sent LPA code(s) as text
+            caption = (msg.caption or "").strip()
+            lpa = caption if caption.upper().startswith("LPA:") else ""
+            notes = "" if lpa else caption
+            db.add_esim(plan_id, "qr", lpa_code=lpa, qr_file_id=file_id, qr_local_path=local_path, notes=notes)
+            added = 1
         elif msg.text:
-            lines = [ln.strip() for ln in msg.text.splitlines() if ln.strip()]
-            for ln in lines:
-                db.add_esim(
-                    plan_id=plan_id,
-                    item_type="lpa",
-                    lpa_code=ln,
-                )
-                added_count += 1
+            codes = [line.strip() for line in msg.text.splitlines() if line.strip()]
+            added, skipped = db.add_lpa_esims_bulk(plan_id, codes)
         else:
-            await msg.reply_text("\u26a0\ufe0f \u064a\u0631\u062c\u0649 \u0625\u0631\u0633\u0627\u0644 \u0643\u0648\u062f LPA \u0646\u0635\u064a \u0623\u0648 \u0625\u0631\u0633\u0627\u0644 \u0635\u0648\u0631\u0629 QR Code.")
+            await msg.reply_text("⚠️ يرجى إرسال أكواد LPA أو صورة QR.")
             return
-
         clear_state(context)
-        status_msg = await msg.reply_text(
-            f"\u2705 <b>\u062a\u0645\u062a \u0625\u0636\u0627\u0641\u0629 {added_count} \u0634\u0631\u064a\u062d\u0629 eSIM \u0625\u0644\u0649 \u0645\u062e\u0632\u0648\u0646 ({html.escape(plan['name'])}) \u0628\u0646\u062c\u0627\u062d!</b>\n"
-            "\U0001f4e2 \u062c\u0627\u0631\u064a \u0625\u0631\u0633\u0627\u0644 \u0625\u0634\u0639\u0627\u0631 \u0639\u0627\u0645 \u0644\u062c\u0645\u064a\u0639 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u064a\u0646 \u0628\u062a\u0648\u0641\u0631 \u0627\u0644\u0645\u062e\u0632\u0648\u0646 \u0627\u0644\u062c\u062f\u064a\u062f...",
-            parse_mode=ParseMode.HTML,
-        )
-        sent, failed = await broadcast_new_inventory(context, plan_id=plan_id, added_count=added_count)
-        await status_msg.edit_text(
-            f"\u2705 <b>\u062a\u0645\u062a \u0625\u0636\u0627\u0641\u0629 {added_count} \u0634\u0631\u064a\u062d\u0629 eSIM \u0625\u0644\u0649 \u0645\u062e\u0632\u0648\u0646 ({html.escape(plan['name'])}) \u0628\u0646\u062c\u0627\u062d!</b>\n"
-            f"\U0001f4e2 <b>\u062a\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0625\u0634\u0639\u0627\u0631 \u0627\u0644\u0639\u0627\u0645 \u0628\u0646\u062c\u0627\u062d \u0625\u0644\u0649:</b> {sent} \u0645\u0633\u062a\u062e\u062f\u0645 (\u0641\u0634\u0644/\u0645\u062d\u0638\u0648\u0631: {failed}).",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [IKB("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0634\u0631\u0627\u0626\u062d \u0623\u062e\u0631\u0649 \u0644\u0646\u0641\u0633 \u0627\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_esim_add:{plan_id}")],
-                [IKB("\U0001f4cb \u0639\u0631\u0636 \u0645\u062e\u0632\u0648\u0646 \u0627\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_esim_list:{plan_id}")],
-                [IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0628\u0627\u0642\u0629", callback_data=f"adm_plan_view:{plan_id}")],
-            ]),
+        buttons = InlineKeyboardMarkup([
+            [IKB("➕ إضافة شرائح أخرى", callback_data=f"adm_esim_add:{plan_id}")],
+            [IKB("📋 عرض المخزون", callback_data=f"adm_esim_list:{plan_id}")],
+            [IKB("🔙 العودة للباقة", callback_data=f"adm_plan_view:{plan_id}")],
+        ])
+        dup = f"\nℹ️ تم تجاهل {skipped} كود مكرر." if skipped else ""
+        if not added:
+            await msg.reply_text(f"⚠️ لم تتم إضافة شرائح جديدة؛ الأكواد المرسلة مكررة ({skipped}).", reply_markup=buttons)
+            return
+        if mode == "silent":
+            await msg.reply_text(f"✅ تمت إضافة {added} شريحة إلى {html.escape(plan['name'])}.{dup}\n🔕 تمت الإضافة دون إرسال إشعارات.", parse_mode=ParseMode.HTML, reply_markup=buttons)
+            return
+        progress = await msg.reply_text("✅ تمت إضافة الشرائح. جارٍ إرسال إشعارات التوفر...", parse_mode=ParseMode.HTML)
+        sent, failed = await broadcast_new_inventory(context, plan_id, added, mode=mode)
+        label = "المنتظرين" if mode == "waitlist" else "المستخدمين والمنتظرين"
+        await progress.edit_text(
+            f"✅ تمت إضافة {added} شريحة إلى {html.escape(plan['name'])}.{dup}\n"
+            f"🔔 تم إشعار {sent} من {label} (تعذر إرسال {failed}).",
+            parse_mode=ParseMode.HTML, reply_markup=buttons,
         )
         return
 
@@ -2209,16 +2572,16 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 notes=esim.get("notes", ""),
             )
         else:
-            await msg.reply_text("\u26a0\ufe0f \u064a\u0631\u062c\u0649 \u0625\u0631\u0633\u0627\u0644 \u0643\u0648\u062f LPA \u0646\u0635\u064a \u0623\u0648 \u0635\u0648\u0631\u0629 QR Code.")
+            await msg.reply_text("⚠️ يرجى إرسال كود LPA نصي أو صورة QR Code.")
             return
 
         clear_state(context)
         await msg.reply_text(
-            f"\u2705 <b>\u062a\u0645 \u062a\u062d\u062f\u064a\u062b \u0628\u064a\u0627\u0646\u0627\u062a \u0627\u0644\u0634\u0631\u064a\u062d\u0629 #{esim_id} \u0628\u0646\u062c\u0627\u062d!</b>",
+            f"✅ <b>تم تحديث بيانات الشريحة #{esim_id} بنجاح!</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [IKB("\U0001f50e \u0639\u0631\u0636 \u0627\u0644\u0634\u0631\u064a\u062d\u0629 \u0628\u0639\u062f \u0627\u0644\u062a\u0639\u062f\u064a\u0644", callback_data=f"adm_esim_item:{esim_id}")],
-                [IKB("\U0001f4cb \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0634\u0631\u0627\u0626\u062d", callback_data=f"adm_esim_list:{plan_id}")],
+                [IKB("🔎 عرض الشريحة بعد التعديل", callback_data=f"adm_esim_item:{esim_id}")],
+                [IKB("📋 العودة لقائمة الشرائح", callback_data=f"adm_esim_list:{plan_id}")],
             ]),
         )
         return
@@ -2228,22 +2591,22 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # --------------------------------------------------------------------------
     if state == "ADM_MANUAL_BAL_USER":
         if not msg.text or not msg.text.strip().isdigit():
-            await msg.reply_text("\u26a0\ufe0f \u064a\u0631\u062c\u0649 \u0625\u0631\u0633\u0627\u0644 \u0645\u0639\u0631\u0641 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 (User ID) \u0643\u0623\u0631\u0642\u0627\u0645 \u0641\u0642\u0637.")
+            await msg.reply_text("⚠️ يرجى إرسال معرف المستخدم (User ID) كأرقام فقط.")
             return
         target_id = int(msg.text.strip())
         target_user = db.get_user(target_id)
         if not target_user:
-            db.upsert_user(target_id, "", "\u0645\u0633\u062a\u062e\u062f\u0645")
+            db.upsert_user(target_id, "", "مستخدم")
             target_user = db.get_user(target_id)
         temp["target_id"] = target_id
         context.user_data["temp"] = temp
         context.user_data["state"] = "ADM_MANUAL_BAL_AMOUNT"
         await msg.reply_text(
-            f"\U0001f464 <b>\u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645:</b> <code>{target_id}</code> ({html.escape(target_user.get('full_name') or '')})\n"
-            f"\U0001f4b0 <b>\u0631\u0635\u064a\u062f\u0647 \u0627\u0644\u062d\u0627\u0644\u064a:</b> <code>{float(target_user['balance']):.2f}</code> {html.escape(currency)}\n\n"
-            "\u0623\u0631\u0633\u0644 \u0627\u0644\u0622\u0646 <b>\u0627\u0644\u0645\u0628\u0644\u063a \u0627\u0644\u0645\u0631\u0627\u062f \u0625\u0636\u0627\u0641\u062a\u0647 \u0623\u0648 \u062e\u0635\u0645\u0647</b>:\n"
-            "\u2022 \u0644\u0625\u0636\u0627\u0641\u0629 \u0631\u0635\u064a\u062f \u0623\u0631\u0633\u0644 \u0627\u0644\u0631\u0642\u0645 \u0645\u0628\u0627\u0634\u0631\u0629 (\u0645\u062b\u0627\u0644: <code>20</code>)\n"
-            "\u2022 \u0644\u062e\u0635\u0645 \u0631\u0635\u064a\u062f \u0636\u0639 \u0639\u0644\u0627\u0645\u0629 \u0633\u0627\u0644\u0628 \u0642\u0628\u0644 \u0627\u0644\u0631\u0642\u0645 (\u0645\u062b\u0627\u0644: <code>-10</code>)",
+            f"👤 <b>المستخدم:</b> <code>{target_id}</code> ({html.escape(target_user.get('full_name') or '')})\n"
+            f"💰 <b>رصيده الحالي:</b> <code>{float(target_user['balance']):.2f}</code> {html.escape(currency)}\n\n"
+            "أرسل الآن <b>المبلغ المراد إضافته أو خصمه</b>:\n"
+            "• لإضافة رصيد أرسل الرقم مباشرة (مثال: <code>20</code>)\n"
+            "• لخصم رصيد ضع علامة سالب قبل الرقم (مثال: <code>-10</code>)",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -2254,25 +2617,28 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         try:
             delta = round(float(msg.text.strip().replace(",", ".")), 2)
         except ValueError:
-            await msg.reply_text("\u26a0\ufe0f \u064a\u0631\u062c\u0649 \u0625\u0631\u0633\u0627\u0644 \u0631\u0642\u0645 \u0635\u062d\u064a\u062d (\u0645\u062b\u0627\u0644: 20 \u0623\u0648 -5).")
+            await msg.reply_text("⚠️ يرجى إرسال رقم صحيح (مثال: 20 أو -5).")
             return
         target_id = int(temp["target_id"])
         new_bal = db.update_user_balance(target_id, delta)
         clear_state(context)
         await msg.reply_text(
-            f"\u2705 <b>\u062a\u0645 \u062a\u062d\u062f\u064a\u062b \u0631\u0635\u064a\u062f \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 <code>{target_id}</code> \u0628\u0646\u062c\u0627\u062d!</b>\n"
-            f"\U0001f4b0 <b>\u0627\u0644\u0631\u0635\u064a\u062f \u0627\u0644\u062c\u062f\u064a\u062f:</b> <code>{float(new_bal or 0):.2f}</code> {html.escape(currency)}",
+            f"✅ <b>تم تحديث رصيد المستخدم <code>{target_id}</code> بنجاح!</b>\n"
+            f"💰 <b>الرصيد الجديد:</b> <code>{float(new_bal or 0):.2f}</code> {html.escape(currency)}",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0623\u0631\u0635\u062f\u0629", callback_data="adm_topups_menu")]]),
+            reply_markup=InlineKeyboardMarkup([
+                [IKB("👤 عرض ملف العميل", callback_data=f"adm_user_view:{target_id}")],
+                [IKB("🔙 العودة لإدارة الأرصدة", callback_data="adm_topups_menu")],
+            ]),
         )
         try:
-            action_word = f"\u0625\u0636\u0627\u0641\u0629 {delta:.2f}" if delta >= 0 else f"\u062e\u0635\u0645 {abs(delta):.2f}"
+            action_word = f"إضافة {delta:.2f}" if delta >= 0 else f"خصم {abs(delta):.2f}"
             await context.bot.send_message(
                 chat_id=target_id,
                 text=(
-                    f"\U0001f514 <b>\u0625\u0634\u0639\u0627\u0631 \u062a\u062d\u062f\u064a\u062b \u0631\u0635\u064a\u062f \u062d\u0633\u0627\u0628\u0643</b>\n"
-                    f"\u062a\u0645 {action_word} {html.escape(currency)} \u0641\u064a \u062d\u0633\u0627\u0628\u0643 \u0628\u0648\u0627\u0633\u0637\u0629 \u0627\u0644\u0625\u062f\u0627\u0631\u0629.\n"
-                    f"\U0001f4b0 <b>\u0631\u0635\u064a\u062f\u0643 \u0627\u0644\u062d\u0627\u0644\u064a:</b> <code>{float(new_bal or 0):.2f}</code> {html.escape(currency)}"
+                    f"🔔 <b>إشعار تحديث رصيد حسابك</b>\n"
+                    f"تم {action_word} {html.escape(currency)} في حسابك بواسطة الإدارة.\n"
+                    f"💰 <b>رصيدك الحالي:</b> <code>{float(new_bal or 0):.2f}</code> {html.escape(currency)}"
                 ),
                 parse_mode=ParseMode.HTML,
             )
@@ -2285,20 +2651,20 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # --------------------------------------------------------------------------
     if state in ("ADM_BAN_USER", "ADM_UNBAN_USER"):
         if not msg.text or not msg.text.strip().isdigit():
-            await msg.reply_text("\u26a0\ufe0f \u064a\u0631\u062c\u0649 \u0625\u0631\u0633\u0627\u0644 \u0645\u0639\u0631\u0641 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 (User ID) \u0643\u0623\u0631\u0642\u0627\u0645 \u0641\u0642\u0637.")
+            await msg.reply_text("⚠️ يرجى إرسال معرف المستخدم (User ID) كأرقام فقط.")
             return
         target_id = int(msg.text.strip())
         if target_id == ADMIN_ID:
-            await msg.reply_text("\u26a0\ufe0f \u0644\u0627 \u064a\u0645\u0643\u0646\u0643 \u062d\u0638\u0631 \u062d\u0633\u0627\u0628 \u0645\u0627\u0644\u0643 \u0627\u0644\u0628\u0648\u062a!")
+            await msg.reply_text("⚠️ لا يمكنك حظر حساب مالك البوت!")
             return
         ban_flag = state == "ADM_BAN_USER"
         db.set_user_ban(target_id, ban_flag)
         clear_state(context)
-        status_str = "\U0001f6ab \u062a\u0645 \u062d\u0638\u0631 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645" if ban_flag else "\u2705 \u062a\u0645 \u0641\u0643 \u0627\u0644\u062d\u0638\u0631 \u0639\u0646 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645"
+        status_str = "🚫 تم حظر المستخدم" if ban_flag else "✅ تم فك الحظر عن المستخدم"
         await msg.reply_text(
-            f"<b>{status_str} (<code>{target_id}</code>) \u0628\u0646\u062c\u0627\u062d!</b>",
+            f"<b>{status_str} (<code>{target_id}</code>) بنجاح!</b>",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645\u064a\u0646", callback_data="adm_users_menu")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("🔙 العودة لإدارة المستخدمين", callback_data="adm_users_menu")]]),
         )
         return
 
@@ -2308,27 +2674,27 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if state == "ADM_BROADCAST_MSG":
         clear_state(context)
         users = db.get_all_active_users()
-        progress = await msg.reply_text(f"\U0001f4e2 \u062c\u0627\u0631\u064a \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0631\u0633\u0627\u0644\u0629 \u0627\u0644\u062c\u0645\u0627\u0639\u064a\u0629 \u0625\u0644\u0649 {len(users)} \u0645\u0633\u062a\u062e\u062f\u0645...")
+        progress = await msg.reply_text(f"📢 جاري إرسال الرسالة الجماعية إلى {len(users)} مستخدم...")
         sent = 0
         failed = 0
         for u in users:
             try:
-                await context.bot.copy_message(
-                    chat_id=u["user_id"],
+                await _send_with_flood_retry(lambda uid=u["user_id"]: context.bot.copy_message(
+                    chat_id=uid,
                     from_chat_id=msg.chat_id,
                     message_id=msg.message_id,
-                )
+                ))
                 sent += 1
                 await asyncio.sleep(0.04)
             except (Forbidden, BadRequest, TelegramError):
                 failed += 1
         await progress.edit_text(
-            f"\u2705 <b>\u0627\u0643\u062a\u0645\u0644 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0631\u0633\u0627\u0644\u0629 \u0627\u0644\u062c\u0645\u0627\u0639\u064a\u0629!</b>\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            f"\U0001f4e8 <b>\u062a\u0645 \u0627\u0644\u0625\u0631\u0633\u0627\u0644 \u0628\u0646\u062c\u0627\u062d \u0625\u0644\u0649:</b> {sent} \u0645\u0633\u062a\u062e\u062f\u0645\n"
-            f"\u26a0\ufe0f <b>\u0641\u0634\u0644 / \u0642\u0627\u0645\u0648\u0627 \u0628\u062d\u0638\u0631 \u0627\u0644\u0628\u0648\u062a:</b> {failed} \u0645\u0633\u062a\u062e\u062f\u0645",
+            f"✅ <b>اكتمل إرسال الرسالة الجماعية!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📨 <b>تم الإرسال بنجاح إلى:</b> {sent} مستخدم\n"
+            f"⚠️ <b>فشل / قاموا بحظر البوت:</b> {failed} مستخدم",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f519 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0623\u062f\u0645\u0646", callback_data="adm_home")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("🔙 لوحة تحكم الأدمن", callback_data="adm_home")]]),
         )
         return
 
@@ -2345,10 +2711,46 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         db.set_setting(key, val)
         clear_state(context)
         await msg.reply_text(
-            f"\u2705 <b>\u062a\u0645 \u062a\u062d\u062f\u064a\u062b \u0627\u0644\u0625\u0639\u062f\u0627\u062f \u0628\u0646\u062c\u0627\u062d \u0625\u0644\u0649:</b> <code>{html.escape(val)}</code>",
+            f"✅ <b>تم تحديث الإعداد بنجاح إلى:</b> <code>{html.escape(val)}</code>",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[IKB("\U0001f519 \u0627\u0644\u0639\u0648\u062f\u0629 \u0644\u0644\u0625\u0639\u062f\u0627\u062f\u0627\u062a", callback_data="adm_settings")]]),
+            reply_markup=InlineKeyboardMarkup([[IKB("🔙 العودة للإعدادات", callback_data="adm_settings")]]),
         )
+        return
+
+
+    if state == "ADM_LOOKUP_ESIM":
+        if not msg.text:
+            await msg.reply_text("أرسل رقم الشريحة مثل #15.")
+            return
+        raw=msg.text.strip().lstrip("#").strip()
+        if not raw.isdigit():
+            await msg.reply_text("⚠️ رقم غير صالح. أرسل رقماً صحيحاً مثل 15.")
+            return
+        esim=db.get_esim(int(raw))
+        if not esim:
+            await msg.reply_text("⚠️ لم يتم العثور على الشريحة. أرسل رقماً آخر أو ألغِ البحث.",reply_markup=InlineKeyboardMarkup([[IKB("🔙 مركز الفحص",callback_data="adm_inspector")]]))
+            return
+        clear_state(context)
+        # Reuse the standard detail view through a synthetic callback query.
+        text=f"🔎 <b>الشريحة #{esim['id']}</b> — {html.escape(esim['country_name'])} / {html.escape(esim['plan_name'])}\nالحالة: {'مباعة' if esim.get('status')=='sold' else 'متاحة'}\nكود LPA: <code>{html.escape(esim.get('lpa_code') or NO_LPA_QR)}</code>"
+        rows=[[IKB("👁 معاينة",callback_data=f"adm_esim_preview:{esim['id']}")]]
+        rows.append([IKB("🧾 عرض كامل التفاصيل",callback_data=f"adm_esim_item:{esim['id']}")])
+        if esim.get("sold_to"):
+            rows.append([IKB("👤 ملف المشتري",callback_data=f"adm_user_view:{esim['sold_to']}")])
+        rows.append([IKB("🔍 بحث آخر",callback_data="adm_inspector")])
+        await msg.reply_text(text,parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if state == "ADM_LOOKUP_USER":
+        if not msg.text:
+            await msg.reply_text("أرسل معرف العميل أو @username.")
+            return
+        target=db.find_user_admin(msg.text.strip())
+        if not target:
+            await msg.reply_text("⚠️ لم يتم العثور على العميل. تحقق من المعرف أو أرسل محاولة أخرى.",reply_markup=InlineKeyboardMarkup([[IKB("🔙 مركز الفحص",callback_data="adm_inspector")]]))
+            return
+        clear_state(context)
+        await render_admin_user_profile(update,target)
         return
 
 
@@ -2358,7 +2760,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 def main() -> None:
     db.init_db()
     if not BOT_TOKEN:
-        raise RuntimeError("\u062e\u0637\u0623: \u0644\u0645 \u064a\u062a\u0645 \u0636\u0628\u0637 BOT_TOKEN \u0641\u064a \u0645\u0644\u0641 .env! \u0642\u0645 \u0628\u062a\u0634\u063a\u064a\u0644 ./install.sh \u0623\u0648 \u062a\u0639\u062f\u064a\u0644 \u0645\u0644\u0641 .env")
+        raise RuntimeError("خطأ: لم يتم ضبط BOT_TOKEN في ملف .env! قم بتشغيل ./install.sh أو تعديل ملف .env")
 
     app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
@@ -2366,7 +2768,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_router))
 
-    logger.info("\u2705 \u062a\u0645 \u062a\u0634\u063a\u064a\u0644 \u0628\u0648\u062a \u0645\u062a\u062c\u0631 \u0634\u0631\u0627\u0626\u062d eSIM \u0628\u0646\u062c\u0627\u062d (\u064a\u0639\u0645\u0644 \u0639\u0644\u0649 \u0645\u062f\u0627\u0631 \u0627\u0644\u0633\u0627\u0639\u0629 24/7)...")
+    logger.info("✅ تم تشغيل بوت متجر شرائح eSIM بنجاح (يعمل على مدار الساعة 24/7)...")
     app.run_polling(drop_pending_updates=True)
 
 
