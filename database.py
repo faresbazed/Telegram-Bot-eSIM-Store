@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 import os
 import sqlite3
+import time
+from decimal import Decimal
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import config
@@ -8,6 +10,31 @@ from config import DB_PATH, SUPPORT_USERNAME, BINANCE_ID, INSTAPAY_ADDRESS, CURR
 
 _INITIAL_DB_PATH = DB_PATH
 _WAL_INITIALIZED_PATHS = set()
+
+# Money is stored as exact-decimal TEXT (up to 8dp). Credited amounts are
+# never rounded: the customer sees the exact fraction that was received.
+MONEY_QUANT = Decimal("0.00000001")
+PRICE_QUANT = Decimal("0.01")
+
+
+def to_decimal(value) -> Decimal:
+    if value is None:
+        return Decimal("0")
+    return Decimal(str(value))
+
+
+def _money_str(d: Decimal) -> str:
+    return format(d.quantize(MONEY_QUANT).normalize(), "f")
+
+
+def fmt_money(value) -> str:
+    """Exact human display: 2dp for clean values, full precision otherwise."""
+    s = _money_str(to_decimal(value))
+    if "." not in s:
+        return s + ".00"
+    if len(s.split(".", 1)[1]) == 1:
+        return s + "0"
+    return s
 
 
 def _current_db_path() -> str:
@@ -95,6 +122,31 @@ def init_db() -> None:
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             );
 
+            CREATE TABLE IF NOT EXISTS binance_pay_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                merchant_trade_no TEXT UNIQUE,
+                user_id INTEGER NOT NULL,
+                amount REAL NOT NULL,
+                currency TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'paid', 'failed')),
+                prepay_id TEXT DEFAULT '',
+                checkout_url TEXT DEFAULT '',
+                paid_amount REAL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                paid_at TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS processed_pay_transactions (
+                transaction_id TEXT PRIMARY KEY,
+                expectation_id INTEGER,
+                user_id INTEGER,
+                amount REAL,
+                currency TEXT,
+                payer_name TEXT,
+                processed_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS refund_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -120,6 +172,21 @@ def init_db() -> None:
                 FOREIGN KEY (plan_id) REFERENCES plans(id) ON DELETE CASCADE
             );
 
+        CREATE TABLE IF NOT EXISTS relay_messages (
+            owner_message_id INTEGER PRIMARY KEY,
+            customer_id INTEGER NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS discount_codes (
+            code TEXT PRIMARY KEY,
+            percent REAL NOT NULL CHECK (percent > 0 AND percent <= 100),
+            active INTEGER NOT NULL DEFAULT 1,
+            max_uses INTEGER,
+            used_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
             CREATE INDEX IF NOT EXISTS idx_users_username ON users(username COLLATE NOCASE);
             CREATE INDEX IF NOT EXISTS idx_plans_country ON plans(country_id);
             CREATE INDEX IF NOT EXISTS idx_esims_plan_status ON esims(plan_id, status, id);
@@ -127,6 +194,7 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_esims_status_sold_at ON esims(status, sold_at DESC);
             CREATE INDEX IF NOT EXISTS idx_esims_lpa_status ON esims(lpa_code, status);
             CREATE INDEX IF NOT EXISTS idx_topup_status_user ON topup_requests(status, user_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_binance_orders_status ON binance_pay_orders(status, id DESC);
             CREATE INDEX IF NOT EXISTS idx_topup_user_id ON topup_requests(user_id, id DESC);
             CREATE INDEX IF NOT EXISTS idx_refund_status_esim ON refund_requests(status, esim_id);
             CREATE INDEX IF NOT EXISTS idx_refund_user_id ON refund_requests(user_id, id DESC);
@@ -147,6 +215,65 @@ def init_db() -> None:
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                 (k, v),
             )
+        # Idempotent: plan archiving — sold-history-preserving "deletion".
+        plan_cols = [r[1] for r in conn.execute("PRAGMA table_info(plans)")]
+        if "is_archived" not in plan_cols:
+            conn.execute("ALTER TABLE plans ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0")
+        # Idempotent: per-image dedupe key for QR inventory (Telegram file_unique_id).
+        esim_cols = [r[1] for r in conn.execute("PRAGMA table_info(esims)")]
+        if "qr_unique_id" not in esim_cols:
+            conn.execute("ALTER TABLE esims ADD COLUMN qr_unique_id TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_esims_qr_unique "
+            "ON esims(qr_unique_id) WHERE qr_unique_id != ''"
+        )
+        conn.commit()
+    _migrate_money_tables()
+
+
+def _migrate_money_tables() -> None:
+    """One-time, idempotent migration: money columns REAL -> exact-decimal TEXT.
+
+    A REAL-affinity column silently converts numeric-looking TEXT back to binary
+    float on write, so the tables must be rebuilt, not just updated. The rebuild
+    needs PRAGMA foreign_keys=OFF, which only takes effect outside a transaction,
+    so it runs on its own connection after the main init work has committed.
+    """
+    defs = {
+        "users": (
+            "balance",
+            "user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT, "
+            "balance TEXT NOT NULL DEFAULT '0', is_banned INTEGER NOT NULL DEFAULT 0, "
+            "created_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        ),
+        "processed_pay_transactions": (
+            "amount",
+            "transaction_id TEXT PRIMARY KEY, expectation_id INTEGER, user_id INTEGER, "
+            "amount TEXT, currency TEXT, payer_name TEXT, processed_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        ),
+    }
+    with get_connection() as conn:
+        conn.execute("PRAGMA foreign_keys = OFF;")
+        for table, (col, create_def) in defs.items():
+            decl = conn.execute(
+                f"SELECT type FROM pragma_table_info('{table}') WHERE name = ?", (col,)
+            ).fetchone()
+            if not decl or (decl["type"] or "").upper() != "REAL":
+                continue
+            cols = [r["name"] for r in conn.execute(f"SELECT name FROM pragma_table_info('{table}')")]
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(f"CREATE TABLE {table}_mig ({create_def})")
+            rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+            for r in rows:
+                vals = [_money_str(to_decimal(r[c])) if c == col else r[c] for c in cols]
+                conn.execute(
+                    f"INSERT INTO {table}_mig ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                    vals,
+                )
+            conn.execute(f"DROP TABLE {table}")
+            conn.execute(f"ALTER TABLE {table}_mig RENAME TO {table}")
+            conn.commit()
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username COLLATE NOCASE)")
         conn.commit()
 
 
@@ -349,7 +476,10 @@ def get_revenue_analytics() -> Dict[str, Any]:
             "approved_topups_total": round(float(topups["approved_total"] or 0.0), 2),
             "binance_topups_total": round(float(topups["binance_total"] or 0.0), 2),
             "instapay_topups_total": round(float(topups["instapay_total"] or 0.0), 2),
-            "total_user_balances": round(float(wallets_row["total_balances"] or 0.0), 2),
+            "total_user_balances": sum(
+                (to_decimal(r["balance"]) for r in conn.execute("SELECT balance FROM users").fetchall()),
+                Decimal("0"),
+            ),
             "active_stock_alerts": int(wallets_row["active_alerts"] or 0),
             "top_plans": [dict(r) for r in top_plans_rows],
         }
@@ -405,10 +535,11 @@ def update_user_balance(user_id: int, delta: float) -> Optional[float]:
         if not row:
             conn.execute("ROLLBACK")
             return None
-        new_balance = round(float(row["balance"]) + float(delta), 2)
+        new_balance = to_decimal(row["balance"]) + to_decimal(delta)
         if new_balance < 0:
-            new_balance = 0.0
-        conn.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_balance, user_id))
+            new_balance = Decimal("0")
+        new_balance = new_balance.quantize(MONEY_QUANT)
+        conn.execute("UPDATE users SET balance = ? WHERE user_id = ?", (_money_str(new_balance), user_id))
         conn.commit()
         return new_balance
 
@@ -420,8 +551,8 @@ def set_user_balance(user_id: int, new_balance: float) -> Optional[float]:
         if not row:
             conn.execute("ROLLBACK")
             return None
-        clean_bal = round(max(0.0, float(new_balance)), 2)
-        conn.execute("UPDATE users SET balance = ? WHERE user_id = ?", (clean_bal, user_id))
+        clean_bal = max(Decimal("0"), to_decimal(new_balance)).quantize(MONEY_QUANT)
+        conn.execute("UPDATE users SET balance = ? WHERE user_id = ?", (_money_str(clean_bal), user_id))
         conn.commit()
         return clean_bal
 
@@ -504,23 +635,51 @@ def add_plan(country_id: int, name: str, description: str, price: float) -> int:
         return cur.lastrowid
 
 
-def get_plans_by_country(country_id: int) -> List[Dict[str, Any]]:
+def get_plans_by_country(country_id: int, include_archived: bool = False) -> List[Dict[str, Any]]:
+    where = "WHERE p.country_id = ?" if include_archived else "WHERE p.country_id = ? AND p.is_archived = 0"
     with get_connection() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT p.*,
                    c.name AS country_name,
                    SUM(CASE WHEN e.status = 'available' THEN 1 ELSE 0 END) AS available_count
             FROM plans p
             JOIN countries c ON c.id = p.country_id
             LEFT JOIN esims e ON e.plan_id = p.id
-            WHERE p.country_id = ?
+            {where}
             GROUP BY p.id
             ORDER BY p.price ASC, p.id ASC
             """,
             (country_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def count_sold_esims(plan_id: int) -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM esims WHERE plan_id = ? AND status = 'sold'",
+            (plan_id,),
+        ).fetchone()
+    return int(row["c"])
+
+
+def archive_plan(plan_id: int) -> bool:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE plans SET is_archived = 1 WHERE id = ?", (plan_id,)
+        )
+        conn.commit()
+    return cur.rowcount == 1
+
+
+def unarchive_plan(plan_id: int) -> bool:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE plans SET is_archived = 0 WHERE id = ?", (plan_id,)
+        )
+        conn.commit()
+    return cur.rowcount == 1
 
 
 def get_plan(plan_id: int) -> Optional[Dict[str, Any]]:
@@ -651,17 +810,42 @@ def add_esim(
     qr_file_id: str = "",
     qr_local_path: str = "",
     notes: str = "",
-) -> int:
+    qr_unique_id: str = "",
+) -> Optional[int]:
+    # Duplicate protection: the same underlying image (Telegram file_unique_id)
+    # must never become two sellable eSIMs. Pre-check + partial UNIQUE index
+    # backstop make it safe under concurrent handler execution.
     with get_connection() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO esims (plan_id, item_type, lpa_code, qr_file_id, qr_local_path, notes, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'available')
-            """,
-            (plan_id, item_type, lpa_code.strip(), qr_file_id.strip(), qr_local_path.strip(), notes.strip()),
-        )
+        fuid = qr_unique_id.strip()
+        if fuid:
+            dup = conn.execute(
+                "SELECT id FROM esims WHERE qr_unique_id = ?", (fuid,)
+            ).fetchone()
+            if dup:
+                return None
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO esims (plan_id, item_type, lpa_code, qr_file_id, qr_local_path, notes, qr_unique_id, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'available')
+                """,
+                (plan_id, item_type, lpa_code.strip(), qr_file_id.strip(), qr_local_path.strip(), notes.strip(), fuid),
+            )
+        except sqlite3.IntegrityError:
+            return None
         conn.commit()
         return cur.lastrowid
+
+
+def find_esim_by_qr_unique(qr_unique_id: str) -> Optional[Dict[str, Any]]:
+    fuid = (qr_unique_id or "").strip()
+    if not fuid:
+        return None
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM esims WHERE qr_unique_id = ?", (fuid,)
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def add_lpa_esims_bulk(plan_id: int, lpa_codes: List[str]) -> Tuple[int, int]:
@@ -826,6 +1010,7 @@ def purchase_esims_atomic(
     user_id: int,
     plan_id: int,
     quantity: int = 1,
+    discount_code: Optional[str] = None,
 ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
     """
     Atomically verifies user eligibility, available stock for `quantity` eSIMs,
@@ -856,13 +1041,39 @@ def purchase_esims_atomic(
                 """,
                 (plan_id,),
             ).fetchone()
-            if not plan:
+            if not plan or int(plan["is_archived"] or 0):
                 conn.execute("ROLLBACK")
                 return False, "plan_not_found", None
 
-            unit_price = round(float(plan["price"]), 2)
-            total_price = round(unit_price * qty, 2)
-            balance = round(float(user["balance"]), 2)
+            unit_price = to_decimal(plan["price"]).quantize(PRICE_QUANT)
+            total_price = unit_price * qty
+            balance = to_decimal(user["balance"])
+
+            gross_total = total_price
+            discount_amount = Decimal("0")
+            discount_percent = Decimal("0")
+            applied_code: Optional[str] = None
+            if discount_code:
+                code_norm = discount_code.strip().upper()
+                cur_dc = conn.execute(
+                    """
+                    UPDATE discount_codes
+                    SET used_count = used_count + 1
+                    WHERE code = ? AND active = 1
+                      AND (max_uses IS NULL OR used_count < max_uses)
+                    """,
+                    (code_norm,),
+                )
+                if cur_dc.rowcount != 1:
+                    conn.execute("ROLLBACK")
+                    return False, "invalid_discount", {"code": discount_code}
+                dc_row = conn.execute(
+                    "SELECT percent FROM discount_codes WHERE code = ?", (code_norm,)
+                ).fetchone()
+                discount_percent = to_decimal(dc_row["percent"])
+                discount_amount = (gross_total * discount_percent / Decimal("100")).quantize(PRICE_QUANT)
+                total_price = (gross_total - discount_amount).quantize(PRICE_QUANT)
+                applied_code = code_norm
 
             esims = conn.execute(
                 "SELECT * FROM esims WHERE plan_id = ? AND status = 'available' ORDER BY id ASC LIMIT ?",
@@ -880,10 +1091,10 @@ def purchase_esims_atomic(
                     "quantity": qty,
                 }
 
-            new_balance = round(balance - total_price, 2)
+            new_balance = (balance - total_price).quantize(MONEY_QUANT)
             cur_bal = conn.execute(
-                "UPDATE users SET balance = ? WHERE user_id = ? AND balance >= ?",
-                (new_balance, user_id, round(total_price - 1e-6, 6)),
+                "UPDATE users SET balance = ? WHERE user_id = ?",
+                (_money_str(new_balance), user_id),
             )
             if cur_bal.rowcount != 1:
                 conn.execute("ROLLBACK")
@@ -904,7 +1115,7 @@ def purchase_esims_atomic(
                         sold_at = CURRENT_TIMESTAMP
                     WHERE id = ? AND status = 'available'
                     """,
-                    (user_id, unit_price, eid),
+                    (user_id, float(unit_price), eid),
                 )
                 if cur_esim.rowcount != 1:
                     conn.execute("ROLLBACK")
@@ -939,6 +1150,10 @@ def purchase_esims_atomic(
             summary["paid_price"] = total_price
             summary["total_paid"] = total_price
             summary["new_balance"] = new_balance
+            summary["gross_total"] = gross_total
+            summary["discount_amount"] = discount_amount
+            summary["discount_percent"] = discount_percent
+            summary["discount_code"] = applied_code
             return True, "success", summary
         except Exception as exc:
             conn.execute("ROLLBACK")
@@ -1049,15 +1264,75 @@ def process_topup_request(req_id: int, approve: bool) -> Tuple[bool, str, Option
             new_balance = None
             if approve:
                 user = conn.execute("SELECT balance FROM users WHERE user_id = ?", (req["user_id"],)).fetchone()
-                current_bal = float(user["balance"]) if user else 0.0
-                new_balance = round(current_bal + float(req["amount"]), 2)
-                conn.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_balance, req["user_id"]))
+                current_bal = to_decimal(user["balance"]) if user else Decimal("0")
+                new_balance = (current_bal + to_decimal(req["amount"])).quantize(MONEY_QUANT)
+                conn.execute("UPDATE users SET balance = ? WHERE user_id = ?", (_money_str(new_balance), req["user_id"]))
 
             conn.commit()
             result = dict(req)
             result["status"] = new_status
             result["new_balance"] = new_balance
             return True, new_status, result
+        except Exception as exc:
+            conn.execute("ROLLBACK")
+            return False, f"error:{exc}", None
+
+
+def approve_binance_topup_with_transfer(
+    req_id: int, transaction_id: str, amount, currency: str, payer_name: str
+) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    """Atomically approves a manual Binance topup tied to an admin-confirmed
+    canonical transfer: reserves the transaction ID (replay protection) and
+    credits the exact actual amount in the same transaction. Any failure rolls
+    everything back and the request stays pending.
+
+    Statuses: not_found / already_processed (request) / transfer_already_used /
+    user_not_found / approved / error:<exc>
+    """
+    with get_connection() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            req = conn.execute("SELECT * FROM topup_requests WHERE id = ?", (req_id,)).fetchone()
+            if not req:
+                conn.execute("ROLLBACK")
+                return False, "not_found", None
+            if req["status"] != "pending":
+                conn.execute("ROLLBACK")
+                return False, "already_processed", dict(req)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO processed_pay_transactions
+                        (transaction_id, user_id, amount, currency, payer_name)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        transaction_id,
+                        req["user_id"],
+                        _money_str(to_decimal(amount)),
+                        (currency or "").strip(),
+                        (payer_name or "")[:64],
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                conn.execute("ROLLBACK")
+                return False, "transfer_already_used", dict(req)
+            conn.execute(
+                "UPDATE topup_requests SET status = 'approved', processed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (req_id,),
+            )
+            user = conn.execute("SELECT balance FROM users WHERE user_id = ?", (req["user_id"],)).fetchone()
+            if not user:
+                conn.execute("ROLLBACK")
+                return False, "user_not_found", dict(req)
+            new_balance = (to_decimal(user["balance"]) + to_decimal(amount)).quantize(MONEY_QUANT)
+            conn.execute("UPDATE users SET balance = ? WHERE user_id = ?", (_money_str(new_balance), req["user_id"]))
+            conn.commit()
+            result = dict(req)
+            result["status"] = "approved"
+            result["new_balance"] = new_balance
+            result["amount"] = to_decimal(amount).quantize(MONEY_QUANT)
+            return True, "approved", result
         except Exception as exc:
             conn.execute("ROLLBACK")
             return False, f"error:{exc}", None
@@ -1252,3 +1527,262 @@ def get_users_export_rows() -> List[Dict[str, Any]]:
             """
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ----------------- Binance Pay Auto Top-Up Operations -----------------
+def create_binance_pay_order(user_id: int, amount: float, currency: str) -> Tuple[int, str]:
+    """Creates a pending Binance Pay order and returns (order_id, merchant_trade_no)."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO binance_pay_orders (user_id, amount, currency, status)
+            VALUES (?, ?, ?, 'pending')
+            """,
+            (user_id, round(float(amount), 2), currency.strip()),
+        )
+        order_id = cur.lastrowid
+        trade_no = f"ES{order_id:012d}"
+        conn.execute(
+            "UPDATE binance_pay_orders SET merchant_trade_no = ? WHERE id = ?",
+            (trade_no, order_id),
+        )
+        conn.commit()
+        return order_id, trade_no
+
+
+def set_binance_pay_order_created(order_id: int, prepay_id: str, checkout_url: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE binance_pay_orders SET prepay_id = ?, checkout_url = ? WHERE id = ?",
+            ((prepay_id or "").strip(), (checkout_url or "").strip(), order_id),
+        )
+        conn.commit()
+
+
+def set_binance_pay_order_failed(order_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE binance_pay_orders SET status = 'failed' WHERE id = ? AND status = 'pending'",
+            (order_id,),
+        )
+        conn.commit()
+
+
+def get_binance_pay_order(trade_no: str) -> Optional[Dict[str, Any]]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM binance_pay_orders WHERE merchant_trade_no = ?",
+            (trade_no,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def mark_binance_pay_order_paid(
+    trade_no: str, paid_amount: float
+) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    """Atomically marks a Binance Pay order paid and credits the user's balance.
+
+    Safe against duplicate webhook deliveries: only the first call for a
+    pending order credits the balance; later calls return already_processed.
+    """
+    with get_connection() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM binance_pay_orders WHERE merchant_trade_no = ?",
+                (trade_no,),
+            ).fetchone()
+            if not row:
+                conn.execute("ROLLBACK")
+                return False, "not_found", None
+            if row["status"] != "pending":
+                conn.execute("ROLLBACK")
+                return False, "already_processed", dict(row)
+
+            conn.execute(
+                """
+                UPDATE binance_pay_orders
+                SET status = 'paid', paid_amount = ?, paid_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (round(float(paid_amount), 2), row["id"]),
+            )
+            user = conn.execute(
+                "SELECT balance FROM users WHERE user_id = ?", (row["user_id"],)
+            ).fetchone()
+            if not user:
+                conn.execute("ROLLBACK")
+                return False, "user_not_found", dict(row)
+            new_balance = (to_decimal(user["balance"]) + to_decimal(row["amount"])).quantize(MONEY_QUANT)
+            conn.execute(
+                "UPDATE users SET balance = ? WHERE user_id = ?",
+                (_money_str(new_balance), row["user_id"]),
+            )
+            conn.commit()
+            result = dict(row)
+            result["status"] = "paid"
+            result["new_balance"] = new_balance
+            return True, "paid", result
+        except Exception as exc:
+            conn.execute("ROLLBACK")
+            return False, f"error:{exc}", None
+
+
+# ----------------- Binance Pay Auto Top-Up (transaction-ID verification) -----------------
+def is_pay_transaction_processed(transaction_id: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM processed_pay_transactions WHERE transaction_id = ?",
+            (transaction_id,),
+        ).fetchone()
+        return row is not None
+
+
+def credit_topup_from_transaction(
+    user_id: int,
+    transaction_id: str,
+    amount: float,
+    currency: str,
+    payer_name: str,
+) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    """Atomically credits a verified Binance Pay transfer to a user's balance.
+
+    The processed_pay_transactions primary key guarantees the same Binance
+    transaction ID can never credit any balance twice, even under retries
+    or two customers submitting the same ID at the same moment.
+    """
+    with get_connection() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO processed_pay_transactions
+                        (transaction_id, user_id, amount, currency, payer_name)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        transaction_id,
+                        user_id,
+                        _money_str(to_decimal(amount)),
+                        (currency or "").strip(),
+                        (payer_name or "")[:64],
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                conn.execute("ROLLBACK")
+                return False, "already_processed", None
+
+            user = conn.execute(
+                "SELECT balance FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            if not user:
+                conn.execute("ROLLBACK")
+                return False, "user_not_found", None
+            new_balance = (to_decimal(user["balance"]) + to_decimal(amount)).quantize(MONEY_QUANT)
+            conn.execute(
+                "UPDATE users SET balance = ? WHERE user_id = ?",
+                (_money_str(new_balance), user_id),
+            )
+            conn.commit()
+            return True, "credited", {
+                "user_id": user_id,
+                "new_balance": new_balance,
+                "amount": to_decimal(amount).quantize(MONEY_QUANT),
+            }
+        except Exception as exc:
+            conn.execute("ROLLBACK")
+            return False, f"error:{exc}", None
+
+
+# ==============================================================================
+# RELAY (customer -> owner) + DISCOUNT CODES
+# ==============================================================================
+def record_relay_message(owner_message_id: int, customer_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO relay_messages (owner_message_id, customer_id) VALUES (?, ?)",
+            (owner_message_id, customer_id),
+        )
+
+
+def get_relay_customer(owner_message_id: int) -> Optional[int]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT customer_id FROM relay_messages WHERE owner_message_id = ?",
+            (owner_message_id,),
+        ).fetchone()
+    return int(row["customer_id"]) if row else None
+
+
+def create_discount_code(code: str, percent, max_uses: Optional[int] = None) -> bool:
+    code_norm = (code or "").strip().upper()
+    try:
+        pct = to_decimal(percent)
+    except Exception:
+        return False
+    if not code_norm or pct <= 0 or pct > 100:
+        return False
+    with get_connection() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO discount_codes (code, percent, max_uses) VALUES (?, ?, ?)",
+                (code_norm, float(pct), max_uses),
+            )
+        except sqlite3.IntegrityError:
+            return False
+    return True
+
+
+def list_discount_codes() -> List[Dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM discount_codes ORDER BY created_at DESC, code ASC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_discount_code(code: str) -> Optional[Dict[str, Any]]:
+    code_norm = (code or "").strip().upper()
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM discount_codes
+            WHERE code = ? AND active = 1
+              AND (max_uses IS NULL OR used_count < max_uses)
+            """,
+            (code_norm,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def deactivate_discount_code(code: str) -> bool:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE discount_codes SET active = 0 WHERE code = ?",
+            ((code or "").strip().upper(),),
+        )
+    return cur.rowcount == 1
+
+
+def list_users_by_balance(offset: int = 0, limit: int = 10) -> List[Dict[str, Any]]:
+    # Exact numeric order on TEXT Decimal balances: sort in Python by Decimal
+    # (SQL LENGTH/lexical ordering is wrong across fractional lengths).
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id, username, full_name, balance, is_banned,
+                   (SELECT COUNT(*) FROM esims WHERE sold_to = users.user_id AND status = 'sold') AS purchases_count
+            FROM users
+            """
+        ).fetchall()
+    items = [dict(r) for r in rows]
+    items.sort(key=lambda u: int(u["user_id"]))
+    items.sort(key=lambda u: to_decimal(u.get("balance") or 0), reverse=True)
+    return items[offset : offset + limit]
+
+
+def count_users() -> int:
+    with get_connection() as conn:
+        row = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()
+    return int(row["c"])

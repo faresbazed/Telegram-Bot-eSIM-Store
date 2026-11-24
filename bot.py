@@ -5,6 +5,9 @@ import html
 import io
 import logging
 import os
+import re
+import time
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -32,6 +35,7 @@ from telegram.ext import (
 
 from config import BOT_TOKEN, ADMIN_ID, QR_DIR
 import database as db
+import binance_pay as bp
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -184,7 +188,7 @@ async def deliver_esim_to_chat(
         f"💵 <b>السعر:</b> {paid_price:.2f} {html.escape(currency)}",
     ]
     if new_balance is not None:
-        caption_lines.append(f"💰 <b>رصيدك المتبقي:</b> {float(new_balance):.2f} {html.escape(currency)}")
+        caption_lines.append(f"💰 <b>رصيدك المتبقي:</b> {db.fmt_money(new_balance)} {html.escape(currency)}")
     if lpa_code:
         caption_lines.extend([
             "",
@@ -606,7 +610,7 @@ async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "━━━━━━━━━━━━━━━━━━━━\n"
         "🌐 نقدم لك شرائح اتصال إلكترونية (eSIM) فورية لجميع دول العالم بأسعار تنافسية واستلام فوري لكود الـ QR.\n\n"
         f"🆔 <b>معرف حسابك:</b> <code>{user.id}</code>\n"
-        f"💰 <b>رصيدك الحالي:</b> <code>{float(u_row['balance']):.2f}</code> {html.escape(currency)}\n\n"
+        f"💰 <b>رصيدك الحالي:</b> <code>{db.fmt_money(u_row['balance'])}</code> {html.escape(currency)}\n\n"
         "👇 <b>اختر من القائمة التالية ما يناسبك:</b>"
     )
     if update.callback_query:
@@ -665,6 +669,10 @@ async def show_admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         ],
         [
             IKB("👥 إدارة المستخدمين والحظر", callback_data="adm_users_menu"),
+            IKB("📋 قائمة المستخدمين بالأرصدة", callback_data="adm_users_list:0"),
+        ],
+        [
+            IKB("🎟 أكواد الخصم", callback_data="adm_discounts"),
             IKB("📢 رسالة جماعية للكل", callback_data="adm_broadcast_start"),
         ],
         [
@@ -680,28 +688,47 @@ async def render_user_plan_view(update, context, user, plan_id: int, qty: int = 
     if not plan:
         await show_home(update, context)
         return
+    if int(plan.get("is_archived") or 0):
+        await safe_edit_or_send(
+            update,
+            "⚠️ هذه الباقة لم تعد متاحة حالياً.",
+            InlineKeyboardMarkup([[IKB("🏠 القائمة الرئيسية", callback_data="home")]]),
+        )
+        return
     currency = get_currency()
     u_row = db.get_user(user.id)
     if not u_row:
         u_row = ensure_user_synced(user, context)
     available = int(plan.get("available_count") or 0)
-    balance = float(u_row.get("balance") or 0)
-    unit = round(float(plan["price"]), 2)
+    balance = db.to_decimal(u_row.get("balance") or 0)
+    unit = db.to_decimal(plan["price"]).quantize(db.PRICE_QUANT)
     max_qty = max(1, min(available, 10))
     qty = max(1, min(int(qty), max_qty))
-    total = round(unit * qty, 2)
+    total = unit * qty
+    disc_code = (context.user_data.get("temp", {}) or {}).get("discount_code")
+    disc = db.get_discount_code(disc_code) if disc_code else None
+    discount_amount = Decimal("0")
+    if disc:
+        discount_amount = (total * float(disc["percent"]) / Decimal("100")).quantize(db.PRICE_QUANT)
+        total = (total - discount_amount).quantize(db.PRICE_QUANT)
     stock = f"✅ متوفر للاستلام الفوري ({available} شريحة)" if available else "❌ نفدت الكمية حالياً"
     desc = f"📝 <b>تفاصيل الباقة:</b>\n{html.escape(plan['description'])}\n\n" if plan.get("description") else ""
     qty_lines = ""
     if available > 1:
-        qty_lines = f"🔢 <b>الكمية المختارة:</b> {qty} شريحة\n🧾 <b>الإجمالي:</b> <code>{total:.2f}</code> {html.escape(currency)}\n"
+        qty_lines = f"🔢 <b>الكمية المختارة:</b> {qty} شريحة\n🧾 <b>الإجمالي:</b> <code>{(unit * qty):.2f}</code> {html.escape(currency)}\n"
+    disc_line = ""
+    if disc:
+        disc_line = (
+            f"🎟 <b>كود الخصم {html.escape(disc_code)} ({float(disc['percent']):g}%):</b> <code>-{discount_amount:.2f}</code>\n"
+            f"💳 <b>الإجمالي بعد الخصم:</b> <code>{total:.2f}</code> {html.escape(currency)}\n"
+        )
     text = (
         "📦 <b>تفاصيل الباقة المختارة</b>\n━━━━━━━━━━━━━━━━━━━━\n"
         f"🌍 <b>الدولة:</b> {html.escape(plan['country_name'])}\n"
         f"🏷 <b>الباقة:</b> {html.escape(plan['name'])}\n"
         f"💵 <b>سعر الشريحة الواحدة:</b> <code>{unit:.2f}</code> {html.escape(currency)}\n"
-        f"{qty_lines}📊 <b>حالة المخزون:</b> {stock}\n\n{desc}"
-        f"💰 <b>رصيدك الحالي:</b> <code>{balance:.2f}</code> {html.escape(currency)}"
+        f"{qty_lines}{disc_line}📊 <b>حالة المخزون:</b> {stock}\n\n{desc}"
+        f"💰 <b>رصيدك الحالي:</b> <code>{db.fmt_money(balance)}</code> {html.escape(currency)}"
     )
     rows = []
     if available:
@@ -714,8 +741,9 @@ async def render_user_plan_view(update, context, user, plan_id: int, qty: int = 
         if balance >= total:
             label = f"✅ تأكيد شراء {qty} شرائح ({total:.2f} {currency})" if qty > 1 else f"✅ تأكيد الشراء ({total:.2f} {currency})"
             rows.append([IKB(label, callback_data=f"u_buy_confirm:{plan_id}:{qty}", style="success")])
+            rows.append([IKB("🎟 لديك كود خصم؟", callback_data=f"u_plan_discount:{plan_id}:{qty}")])
         else:
-            diff = round(total - balance, 2)
+            diff = total - balance
             text += f"\n\n⚠️ <b>رصيدك غير كافٍ لهذه الكمية. تحتاج إلى شحن <code>{diff:.2f}</code> {html.escape(currency)} إضافية.</b>"
             rows.append([IKB("💳 شحن الرصيد الآن", callback_data="u_topup")])
     else:
@@ -738,8 +766,17 @@ async def render_admin_add_esim(update, context, plan_id: int, mode: str = "all"
         return
     mode = mode if mode in ("all", "waitlist", "silent") else "all"
     wait_count = db.get_plan_alert_count(plan_id)
+    prev_temp = context.user_data.get("temp", {}) if context.user_data.get("state") == "ADM_ADD_ESIM" else {}
+    keep_batch = prev_temp.get("plan_id") == plan_id and prev_temp.get("batch_id")
     context.user_data["state"] = "ADM_ADD_ESIM"
-    context.user_data["temp"] = {"plan_id": plan_id, "notify_mode": mode}
+    new_temp = {"plan_id": plan_id, "notify_mode": mode}
+    if keep_batch:
+        for k in ("batch_id", "batch_added", "batch_progress_id"):
+            if k in prev_temp:
+                new_temp[k] = prev_temp[k]
+    else:
+        new_temp["batch_id"] = int(time.time() * 1000)
+    context.user_data["temp"] = new_temp
     labels = {
         "all": "📢 إشعار عام للكل + المنتظرين",
         "waitlist": f"🔔 للمنتظرين فقط ({wait_count} عميل)",
@@ -751,7 +788,8 @@ async def render_admin_add_esim(update, context, plan_id: int, mode: str = "all"
         f"📦 <b>الباقة:</b> {html.escape(plan['name'])}\n"
         f"🔔 <b>المنتظرون:</b> {wait_count} عميل\n"
         f"📡 <b>وضع الإشعار:</b> {labels[mode]}\n\n"
-        "أرسل كود LPA أو عدة أكواد (كل كود في سطر)، أو أرسل صورة QR. الأكواد المكررة سيتم تجاهلها."
+        "أرسل كود LPA أو عدة أكواد (كل كود في سطر)، أو صور QR — صورة واحدة أو عدة صور أو ألبوم كامل.\n"
+        "كل صورة تُضاف فور وصولها. عند الانتهاء من الصور اضغط ✅ إنهاء الإضافة. الأكواد المكررة سيتم تجاهلها."
     )
     kb = InlineKeyboardMarkup([
         [IKB(f"{'✅ ' if mode == 'all' else ''}📢 للكل", callback_data=f"adm_esim_mode:{plan_id}:all"),
@@ -770,7 +808,7 @@ async def render_admin_user_profile(update, target: Dict[str, Any]) -> None:
     text=(
         "👤 <b>ملف العميل</b>\n━━━━━━━━━━━━━━━━━━━━\n"
         f"🏷 الاسم: {html.escape(target.get('full_name') or NONE_STR)}\n🔗 اليوزر: {uname}\n🆔 ID: <code>{uid}</code>\n"
-        f"🛡 الحالة: {status}\n💰 الرصيد: <code>{float(target.get('balance') or 0):.2f}</code> {html.escape(currency)}\n"
+        f"🛡 الحالة: {status}\n💰 الرصيد: <code>{db.fmt_money(target.get('balance') or 0)}</code> {html.escape(currency)}\n"
         f"📲 المشتريات: {target.get('purchases_count',len(purchases))} | 💵 الإنفاق: <code>{float(target.get('total_spent') or 0):.2f}</code> {html.escape(currency)}\n"
         f"💳 الشحن المقبول: {target.get('approved_topups_count',0)} (<code>{float(target.get('approved_topups_sum') or 0):.2f}</code>)\n"
         f"⏳ الشحن المعلق: {target.get('pending_topups_count',0)} | ↩️ الاستردادات: {target.get('refunds_count',0)} | 🔔 تنبيهات التوفر: {target.get('stock_alerts_count',0)}"
@@ -789,6 +827,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if update.message and user:
         banned = (not is_admin(user.id)) and db.is_user_banned(user.id)
+        if not banned:
+            await mirror_to_owner(update, context, "أمر من عميل")
         if not banned:
             await update.message.reply_text(
                 "⌨️ <b>القائمة السفلية الملوّنة جاهزة!</b>\n"
@@ -809,6 +849,32 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ==============================================================================
 # Callback Query Router
 # ==============================================================================
+async def render_admin_plan_view(update, plan_id: int) -> None:
+    plan = db.get_plan(plan_id)
+    if not plan:
+        return
+    currency = get_currency()
+    archived_note = "\n🗄 <b>الحالة: مخفية من المتجر (سجل المشتريات محفوظ)</b>" if int(plan.get("is_archived") or 0) else ""
+    text = (
+        f"📦 <b>إدارة الباقة: {html.escape(plan['name'])}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌍 <b>الدولة:</b> {html.escape(plan['country_name'])}\n"
+        f"💵 <b>السعر:</b> {float(plan['price']):.2f} {html.escape(currency)}\n"
+        f"📝 <b>الوصف:</b> {html.escape(plan['description'] or NO_DESC)}\n"
+        f"📲 <b>الشرائح المتاحة بالمخزون:</b> {int(plan['available_count'] or 0)} شريحة"
+        f"{archived_note}"
+    )
+    kb = InlineKeyboardMarkup([
+        [IKB("➕ إضافة شرائح eSIM (LPA أو QR)", callback_data=f"adm_esim_add:{plan_id}")],
+        [IKB("📋 عرض وتعديل/حذف الشرائح بالمخزون", callback_data=f"adm_esim_list:{plan_id}")],
+        [IKB("✏️ تعديل بيانات وسعر الباقة", callback_data=f"adm_plan_edit:{plan_id}")],
+        [IKB("👁 إظهار في المتجر", callback_data=f"adm_plan_unarchive:{plan_id}")] if int(plan.get("is_archived") or 0) else [IKB("🗄 إخفاء من المتجر", callback_data=f"adm_plan_archive:{plan_id}")],
+        [IKB("🗑️ حذف الباقة نهائياً", callback_data=f"adm_plan_del:{plan_id}")],
+        [IKB("🔙 العودة لباقات الدولة", callback_data=f"adm_plans_country:{plan['country_id']}")],
+    ])
+    await safe_edit_or_send(update, text, kb)
+
+
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await check_ban_guard(update):
         return
@@ -818,6 +884,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = q.data
     user = update.effective_user
     currency = get_currency()
+    temp = context.user_data.get("temp", {})
 
     # ---------------- HOME ----------------
     if data == "home":
@@ -835,7 +902,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"👤 <b>الاسم:</b> {html.escape(user.full_name or '')}\n"
             f"🆔 <b>المعرف (ID):</b> <code>{user.id}</code>\n"
-            f"💵 <b>الرصيد المتاح:</b> <code>{float(u_row['balance']):.2f}</code> {html.escape(currency)}\n"
+            f"💵 <b>الرصيد المتاح:</b> <code>{db.fmt_money(u_row['balance'])}</code> {html.escape(currency)}\n"
             f"📦 <b>إجمالي الشرائح المشتراة:</b> {len(purchases)} شريحة\n"
         )
         kb = InlineKeyboardMarkup([
@@ -959,6 +1026,19 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await render_user_plan_view(update, context, user, plan_id, qty=1)
         return
 
+    if data.startswith("u_plan_discount:"):
+        parts = data.split(":")
+        plan_id = int(parts[1])
+        qty = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+        await q.answer()
+        context.user_data["state"] = "USER_DISCOUNT_CODE"
+        context.user_data["temp"] = {"plan_id": plan_id, "qty": qty}
+        await q.message.reply_text(
+            "🎟 أرسل كود الخصم الآن:",
+            reply_markup=InlineKeyboardMarkup([[IKB("🔙 إلغاء", callback_data=f"u_plan:{plan_id}:{qty}")]]),
+        )
+        return
+
     if data.startswith("u_buy_confirm:"):
         parts = data.split(":")
         plan_id = int(parts[1])
@@ -968,9 +1048,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.answer("⚠️ الباقة غير موجودة.", show_alert=True)
             return
         qty = max(1, min(qty, min(int(plan.get("available_count") or 0), 10)))
-        ok, code, result = db.purchase_esims_atomic(user.id, plan_id, quantity=qty)
+        disc_code = (context.user_data.get("temp", {}) or {}).get("discount_code")
+        ok, code, result = db.purchase_esims_atomic(user.id, plan_id, quantity=qty, discount_code=disc_code)
         if not ok:
-            if code == "insufficient_balance":
+            if code == "invalid_discount":
+                context.user_data.get("temp", {}).pop("discount_code", None)
+                await q.answer("⚠️ كود الخصم غير صالح أو انتهى عدد استخداماته.", show_alert=True)
+                await render_user_plan_view(update, context, user, plan_id, qty=qty)
+            elif code == "insufficient_balance":
                 await q.answer("⚠️ رصيدك غير كافٍ لإتمام عملية الشراء!", show_alert=True)
                 await render_user_plan_view(update, context, user, plan_id, qty=qty)
             elif code == "out_of_stock":
@@ -980,6 +1065,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             else:
                 await q.answer("⚠️ تعذر إتمام الشراء، حاول مرة أخرى.", show_alert=True)
             return
+        context.user_data.get("temp", {}).pop("discount_code", None)
         items = result.get("items") or [result]
         total = len(items)
         await q.answer(f"🎉 تم شراء {total} شرائح بنجاح!" if total > 1 else "🎉 تمت عملية الشراء بنجاح!")
@@ -1169,18 +1255,64 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == "u_topup":
         await q.answer()
         clear_state(context)
+        auto_line = (
+            "⚡ <b>شحن فوري تلقائي عبر Binance Pay (يُضاف الرصيد لحظة الدفع)</b>\n"
+            if bp.is_enabled()
+            else ""
+        )
         text = (
             "💳 <b>شحن الرصيد في البوت</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "اختر وسيلة الدفع المناسبة لك لشحن رصيدك:\n\n"
+            f"{auto_line}"
             "🟡 <b>Binance Pay (عملات رقمية - USDT)</b>\n"
             "🟣 <b>InstaPay EG (إنستا باي مصر)</b>"
         )
-        kb = InlineKeyboardMarkup([
+        auto_row = (
+            [[IKB("⚡ شحن فوري تلقائي عبر Binance Pay", callback_data="u_topup_auto")]]
+            if bp.is_enabled()
+            else []
+        )
+        kb = InlineKeyboardMarkup(auto_row + [
             [IKB("🟡 الدفع عبر Binance ID (عملات رقمية)", callback_data="u_topup_m:binance")],
             [IKB("🟣 الدفع عبر InstaPay EG (إنستا باي)", callback_data="u_topup_m:instapay")],
             [IKB("📜 سجل طلبات الشحن السابقة", callback_data="u_topup_history:0")],
             [IKB("🏠 القائمة الرئيسية", callback_data="home")],
+        ])
+        await safe_edit_or_send(update, text, kb)
+        return
+
+    if data == "u_topup_auto":
+        await q.answer()
+        if not bp.is_enabled():
+            await q.answer("⚠️ الشحن التلقائي غير متاح حالياً، جرب وسيلة دفع أخرى.", show_alert=True)
+            return
+        clear_state(context)
+        context.user_data["temp"] = {"method": "binance_auto"}
+        if bp.mode() == "monitor":
+            context.user_data["state"] = "USER_TOPUP_AUTO_PROOF"
+            pay_target = db.get_setting("binance_id", "غير محدد")
+            text = (
+                "⚡ <b>شحن تلقائي عبر Binance Pay</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "1️⃣ حوّل المبلغ اللي عايز تشحنه (USDT) إلى Binance ID التالي:\n"
+                f"<code>{html.escape(pay_target)}</code>\n"
+                "<i>(اضغط على الرقم لنسخه)</i>\n\n"
+                "2️⃣ بعد نجاح التحويل، ابعت <b>صورة إيصال التحويل</b> (السكرين اللي فيه Order ID) هنا <b>خلال ساعة من التحويل</b>.\n\n"
+                "✅ البوت هيتحقق من التحويل في سجل Binance ويضيف رصيدك <b>تلقائياً بنفس المبلغ الواصل بالظبط</b>."
+            )
+        else:
+            context.user_data["state"] = "USER_TOPUP_AUTO_AMOUNT"
+            text = (
+                "⚡ <b>شحن فوري تلقائي عبر Binance Pay</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "1️⃣ أرسل الآن <b>قيمة المبلغ المراد شحنه</b> في رسالة نصية بالأسفل (مثال: <code>10</code> أو <code>25.5</code>).\n"
+                "2️⃣ سيظهر لك زر دفع، اضغطه وأكمل الدفع من تطبيق Binance.\n"
+                "3️⃣ فور إتمام الدفع سيُضاف الرصيد إلى حسابك <b>تلقائياً</b> دون انتظار مراجعة."
+            )
+        kb = InlineKeyboardMarkup([
+            [IKB("🔙 تغيير وسيلة الدفع", callback_data="u_topup")],
+            [IKB("🏠 إلغاء والعودة للرئيسية", callback_data="home")],
         ])
         await safe_edit_or_send(update, text, kb)
         return
@@ -1356,12 +1488,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             country = db.get_country(country_id)
             if not country:
                 return
-            plans = db.get_plans_by_country(country_id)
+            plans = db.get_plans_by_country(country_id, include_archived=True)
             rows = [[IKB("➕ إضافة باقة جديدة لهذه الدولة", callback_data=f"adm_plan_add:{country_id}")]]
             for p in plans:
+                arch = "🗄 " if int(p.get("is_archived") or 0) else ""
                 rows.append([
                     IKB(
-                        f"📦 {p['name']} — {float(p['price']):.2f} {currency} (المتاح: {int(p['available_count'] or 0)})",
+                        f"{arch}📦 {p['name']} — {float(p['price']):.2f} {currency} (المتاح: {int(p['available_count'] or 0)})",
                         callback_data=f"adm_plan_view:{p['id']}",
                     )
                 ])
@@ -1393,25 +1526,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.answer()
             clear_state(context)
             plan_id = int(data.split(":")[1])
-            plan = db.get_plan(plan_id)
-            if not plan:
-                return
-            text = (
-                f"📦 <b>إدارة الباقة: {html.escape(plan['name'])}</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌍 <b>الدولة:</b> {html.escape(plan['country_name'])}\n"
-                f"💵 <b>السعر:</b> {float(plan['price']):.2f} {html.escape(currency)}\n"
-                f"📝 <b>الوصف:</b> {html.escape(plan['description'] or NO_DESC)}\n"
-                f"📲 <b>الشرائح المتاحة بالمخزون:</b> {int(plan['available_count'] or 0)} شريحة"
-            )
-            kb = InlineKeyboardMarkup([
-                [IKB("➕ إضافة شرائح eSIM (LPA أو QR)", callback_data=f"adm_esim_add:{plan_id}")],
-                [IKB("📋 عرض وتعديل/حذف الشرائح بالمخزون", callback_data=f"adm_esim_list:{plan_id}")],
-                [IKB("✏️ تعديل بيانات وسعر الباقة", callback_data=f"adm_plan_edit:{plan_id}")],
-                [IKB("🗑️ حذف الباقة نهائياً", callback_data=f"adm_plan_del:{plan_id}")],
-                [IKB("🔙 العودة لباقات الدولة", callback_data=f"adm_plans_country:{plan['country_id']}")],
-            ])
-            await safe_edit_or_send(update, text, kb)
+            await render_admin_plan_view(update, plan_id)
             return
 
         if data.startswith("adm_plan_edit:"):
@@ -1431,20 +1546,76 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await safe_edit_or_send(update, text, kb)
             return
 
-        if data.startswith("adm_plan_del:"):
+        if data.startswith("adm_plan_archive:") or data.startswith("adm_plan_unarchive:"):
+            plan_id = int(data.split(":")[1])
+            if data.startswith("adm_plan_unarchive:"):
+                db.unarchive_plan(plan_id)
+                await q.answer("👁 الباقة ظاهرة في المتجر الآن.")
+            else:
+                db.archive_plan(plan_id)
+                await q.answer("🗄 تم إخفاء الباقة من المتجر — سجل المشتريات محفوظ.")
+            plan = db.get_plan(plan_id)
+            if plan:
+                await render_admin_plan_view(update, plan_id)
+            return
+
+        if data.startswith("adm_plan_del_confirm:"):
             plan_id = int(data.split(":")[1])
             plan = db.get_plan(plan_id)
             country_id = plan["country_id"] if plan else 0
+            if plan and db.count_sold_esims(plan_id) > 0:
+                # Sold history appeared meanwhile: archive instead of deleting.
+                db.archive_plan(plan_id)
+                await q.answer("🗄 الباقة فيها مبيعات — تم إخفاؤها بدل الحذف.", show_alert=True)
+                await render_admin_plan_view(update, plan_id)
+                return
             db.delete_plan(plan_id)
             await q.answer("🗑️ تم حذف الباقة بنجاح!", show_alert=True)
             if country_id:
                 await safe_edit_or_send(
                     update,
-                    "✅ <b>تم حذف الباقة بنجاح.</b>",
+                    "✅ <b>تم حذف الباقة نهائياً.</b>",
                     InlineKeyboardMarkup([[IKB("🔙 العودة لباقات الدولة", callback_data=f"adm_plans_country:{country_id}")]]),
                 )
             else:
                 await show_admin_home(update, context)
+            return
+
+        if data.startswith("adm_plan_del:"):
+            plan_id = int(data.split(":")[1])
+            plan = db.get_plan(plan_id)
+            if not plan:
+                await q.answer("⚠️ الباقة غير موجودة.", show_alert=True)
+                return
+            sold_count = db.count_sold_esims(plan_id)
+            if sold_count > 0:
+                # Never delete purchase history: archive (hide) instead.
+                db.archive_plan(plan_id)
+                await q.answer("🗄 تم إخفاء الباقة — سجل المشتريات محفوظ.", show_alert=True)
+                await safe_edit_or_send(
+                    update,
+                    f"🗄 <b>باقة «{html.escape(plan['name'])}» فيها {sold_count} شريحة مباعة.</b>\n"
+                    "حذفها كان هيمسح سجل مشتريات العملاء، لذلك تم <b>إخفاؤها من المتجر</b> بدل الحذف.\n"
+                    "المشتريات وسجلات العملاء محفوظة بالكامل، وتقدر تظهرها تاني في أي وقت.",
+                    InlineKeyboardMarkup([
+                        [IKB("👁 إظهار في المتجر", callback_data=f"adm_plan_unarchive:{plan_id}")],
+                        [IKB("🔙 العودة لباقات الدولة", callback_data=f"adm_plans_country:{plan['country_id']}")],
+                    ]),
+                )
+                return
+            avail = int(plan.get("available_count") or 0)
+            await q.answer()
+            await safe_edit_or_send(
+                update,
+                f"🗑️ <b>تأكيد حذف باقة «{html.escape(plan['name'])}» نهائياً؟</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"سيتم حذف <b>{avail}</b> شريحة متاحة معها.\n"
+                "✅ لا يوجد سجل مبيعات مرتبط — المشتريات لن تتأثر.",
+                InlineKeyboardMarkup([
+                    [IKB("✅ تأكيد الحذف النهائي", callback_data=f"adm_plan_del_confirm:{plan_id}", style="danger")],
+                    [IKB("❌ إلغاء", callback_data=f"adm_plan_view:{plan_id}")],
+                ]),
+            )
             return
 
         # ---------------- ADMIN: eSIM INVENTORY (ADD / EDIT / DELETE) ----------------
@@ -1504,6 +1675,49 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 update,
                 f"📲 <b>اختر الباقة لإدارة مخزون الشرائح ({html.escape(country['name'])})</b>:",
                 InlineKeyboardMarkup(rows),
+            )
+            return
+
+        if data in ("adm_esim_add_done", "adm_esim_add_done_silent"):
+            temp2 = context.user_data.get("temp", {})
+            bid2 = temp2.get("batch_id")
+            lock2 = context.bot_data.setdefault("esim_add_locks", {}).setdefault(bid2, asyncio.Lock()) if bid2 else None
+            if lock2:
+                async with lock2:
+                    temp2["batch_closing"] = True
+                    plan_id2 = int(temp2.get("plan_id") or 0)
+                    mode2 = temp2.get("notify_mode", "all")
+                    batch = int(temp2.get("batch_added") or 0)
+            else:
+                plan_id2 = int(temp2.get("plan_id") or 0)
+                mode2 = temp2.get("notify_mode", "all")
+                batch = int(temp2.get("batch_added") or 0)
+            await q.answer()
+            plan2 = db.get_plan(plan_id2) if plan_id2 else None
+            clear_state(context)
+            buttons2 = InlineKeyboardMarkup([
+                [IKB("➕ إضافة شرائح أخرى", callback_data=f"adm_esim_add:{plan_id2}")],
+                [IKB("📋 عرض المخزون", callback_data=f"adm_esim_list:{plan_id2}")],
+                [IKB("🔙 العودة للباقة", callback_data=f"adm_plan_view:{plan_id2}")],
+            ])
+            if not plan2 or not batch:
+                await safe_edit_or_send(update, "⚠️ لا توجد إضافة صور قيد التنفيذ.", buttons2)
+                return
+            if data == "adm_esim_add_done_silent" or mode2 == "silent":
+                await safe_edit_or_send(
+                    update,
+                    f"✅ تمت إضافة {batch} شريحة QR إلى {html.escape(plan2['name'])}.\n🔕 بدون إشعارات.",
+                    buttons2,
+                )
+                return
+            await safe_edit_or_send(update, "✅ تمت إضافة الصور. جارٍ إرسال إشعارات التوفر...", None)
+            sent, failed = await broadcast_new_inventory(context, plan_id2, batch, mode=mode2)
+            label2 = "المنتظرين" if mode2 == "waitlist" else "المستخدمين والمنتظرين"
+            await safe_edit_or_send(
+                update,
+                f"✅ تمت إضافة {batch} شريحة QR إلى {html.escape(plan2['name'])}.\n"
+                f"🔔 تم إشعار {sent} من {label2} (تعذر إرسال {failed}).",
+                buttons2,
             )
             return
 
@@ -1802,9 +2016,141 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await safe_edit_or_send(update, text, kb)
             return
 
+        if data.startswith("adm_topup_cancel:"):
+            await q.answer("تم الإلغاء — الطلب ما زال معلقًا.")
+            return
+
+        if data.startswith("adm_topup_confirm:"):
+            _, req_id_s, tid = data.split(":", 2)
+            req_id = int(req_id_s)
+            req = db.get_topup_request(req_id)
+            if not req or req["status"] != "pending":
+                await q.answer("⚠️ تم معالجة هذا الطلب مسبقاً أو أنه غير موجود.", show_alert=True)
+                return
+            await q.answer("⏳ جاري إعادة التحقق والشحن...")
+            cutoff_ms = int(db.get_setting("auto_topup_cutoff_ms", "0") or 0)
+            try:
+                tx2, _amb = await bp.find_pay_transaction(tid, min_time_ms=cutoff_ms)
+                valid, reason, tx_amount, tx_currency, payer_name = bp.validate_topup_transaction(tx2, min_time_ms=cutoff_ms)
+            except Exception as exc:
+                logger.error("فشل إعادة التحقق من تحويل الطلب %s: %s", req_id, exc)
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"⏸ الطلب <code>#{req_id}</code> ما زال معلقًا: تعذر الاتصال بـ Binance حالياً. لم يُضف أي رصيد.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            if not valid:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"⏸ الطلب <code>#{req_id}</code> ما زال معلقًا: التحويل لم يعد صالحًا (<code>{html.escape(reason)}</code>). لم يُضف أي رصيد.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            ok, status, res = db.approve_binance_topup_with_transfer(req_id, tid, tx_amount, tx_currency, payer_name)
+            if not ok:
+                reason_map = {"transfer_already_used": "هذا التحويل استُخدم بالفعل.", "already_processed": "الطلب عُولج مسبقاً."}
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"⏸ الطلب <code>#{req_id}</code> ما زال معلقًا: {reason_map.get(status, html.escape(str(status)))} لم يُضف أي رصيد.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            try:
+                await context.bot.send_message(
+                    chat_id=res["user_id"],
+                    text=(
+                        "🎉 <b>تم قبول طلب شحن الرصيد الخاص بك!</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"➕ <b>المبلغ المضاف:</b> <code>{db.fmt_money(res['amount'])}</code> {html.escape(currency)}\n"
+                        f"💰 <b>رصيدك الحالي:</b> <code>{db.fmt_money(res['new_balance'])}</code> {html.escape(currency)}\n\n"
+                        "شكراً لثقتك بنا! يمكنك الآن شراء شريحتك فوراً."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "✅ <b>تم الشحن اليدوي المؤكد عبر Binance Pay</b>\n"
+                    f"🧾 الطلب: <code>#{req_id}</code> | العميل: <code>{res['user_id']}</code>\n"
+                    f"💵 المبلغ المضاف: <code>{db.fmt_money(res['amount'])}</code> {html.escape(currency)}\n"
+                    f"🧾 Transaction ID: <code>{html.escape(tid)}</code>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
         if data.startswith("adm_topup_ok:") or data.startswith("adm_topup_no:"):
             approve = data.startswith("adm_topup_ok:")
             req_id = int(data.split(":")[1])
+
+            if approve:
+                req_check = db.get_topup_request(req_id)
+                if req_check and req_check["status"] == "pending" and (req_check.get("method") or "").strip().lower() == "binance":
+                    await q.answer("⏳ جاري التحقق من التحويل في سجل Binance...")
+                    image_bytes = b""
+                    if req_check.get("proof_file_id"):
+                        try:
+                            tg_file = await context.bot.get_file(req_check["proof_file_id"])
+                            image_bytes = bytes(await tg_file.download_as_bytearray())
+                        except Exception as exc:
+                            logger.warning("تعذر تحميل إيصال الطلب اليدوي %s: %s", req_id, exc)
+                    cutoff_ms = int(db.get_setting("auto_topup_cutoff_ms", "0") or 0)
+                    try:
+                        r_status, r_tx, r_reason = await bp.resolve_transfer_for_manual_approval(
+                            req_check.get("proof_text") or "", image_bytes, cutoff_ms
+                        )
+                    except Exception as exc:
+                        logger.error("فشل التحقق من تحويل الطلب اليدوي %s: %s", req_id, exc)
+                        r_status, r_reason = "none", "connection_error"
+                    if r_status != "found":
+                        explain_map = {
+                            "no_order_id": "لم نتمكن من قراءة رقم الطلب (Order ID) من الإيصال. اطلب من العميل إرسال رقم الطلب كنص.",
+                            "not_found": "لا يوجد تحويل وارد في سجل Binance يطابق رقم الطلب الموجود في الإيصال.",
+                            "ambiguous": "رقم الطلب يطابق أكثر من عملية في السجل.",
+                            "multi": "أرقام الإيصال تطابق أكثر من عملية مختلفة في السجل.",
+                            "already_used": "هذا التحويل تم استخدامه من قبل وأُضيف رصيده سابقاً.",
+                            "outgoing": "العملية المطابقة صادرة وليست تحويلاً وارداً.",
+                            "wrong_type": "العملية المطابقة ليست تحويلاً مباشراً (C2C).",
+                            "too_old": "التحويل المطابق مر عليه أكثر من ساعة أو يسبق تفعيل الشحن التلقائي.",
+                            "wrong_currency": "عملة التحويل المطابق ليست USDT.",
+                            "connection_error": "تعذر الاتصال بـ Binance حالياً، حاول مرة أخرى بعد قليل.",
+                        }
+                        await context.bot.send_message(
+                            chat_id=ADMIN_ID,
+                            text=(
+                                "⏸ <b>طلب الشحن اليدوي ما زال معلقًا — لم يُضف أي رصيد</b>\n"
+                                f"🧾 الطلب: <code>#{req_id}</code>\n"
+                                f"السبب: {explain_map.get(r_reason, html.escape(str(r_reason)))}"
+                            ),
+                            parse_mode=ParseMode.HTML,
+                        )
+                        return
+                    tx_amount = db.to_decimal(r_tx.get("amount"))
+                    tx_tid = str(r_tx.get("transactionId") or "")
+                    tx_payer = ((r_tx.get("payerInfo") or {}).get("name") or "غير متاح")
+                    await context.bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=(
+                            "🔎 <b>تأكيد الشحن اليدوي — تم العثور على التحويل</b>\n"
+                            "━━━━━━━━━━━━━━━━━━━━\n"
+                            f"🧾 الطلب: <code>#{req_id}</code> | العميل طلب: <code>{db.fmt_money(req_check['amount'])}</code> {html.escape(currency)}\n"
+                            f"💵 <b>المبلغ الفعلي الوارد:</b> <code>{db.fmt_money(tx_amount)}</code> {html.escape(str(r_tx.get('currency') or ''))}\n"
+                            f"🆔 <b>Order ID:</b> <code>{html.escape(str(r_tx.get('orderId') or ''))}</code>\n"
+                            f"🧾 <b>Transaction ID:</b> <code>{html.escape(tx_tid)}</code>\n"
+                            f"👤 <b>المرسل:</b> {html.escape(tx_payer)}\n\n"
+                            "سيُضاف <b>المبلغ الفعلي بالظبط</b> لرصيد العميل."
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([
+                            [IKB(f"✅ تأكيد وشحن {db.fmt_money(tx_amount)}", callback_data=f"adm_topup_confirm:{req_id}:{tx_tid}")],
+                            [IKB("❌ إلغاء (يبقى الطلب معلقًا)", callback_data=f"adm_topup_cancel:{req_id}")],
+                        ]),
+                    )
+                    return
+
             ok, status, res = db.process_topup_request(req_id, approve=approve)
             if not ok:
                 await q.answer("⚠️ تم معالجة هذا الطلب مسبقاً أو أنه غير موجود.", show_alert=True)
@@ -1816,7 +2162,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     "🎉 <b>تم قبول طلب شحن الرصيد الخاص بك!</b>\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
                     f"➕ <b>المبلغ المضاف:</b> <code>{float(res['amount']):.2f}</code> {html.escape(currency)}\n"
-                    f"💰 <b>رصيدك الحالي:</b> <code>{float(res['new_balance']):.2f}</code> {html.escape(currency)}\n\n"
+                    f"💰 <b>رصيدك الحالي:</b> <code>{db.fmt_money(res['new_balance'])}</code> {html.escape(currency)}\n\n"
                     "شكراً لثقتك بنا! يمكنك الآن شراء شريحتك فوراً."
                 )
             else:
@@ -1869,7 +2215,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 f"💰 إجمالي المبيعات: {a['sold_esims']} — <code>{a['total_revenue']:.2f}</code> {html.escape(currency)}\n"
                 f"💳 الشحن المقبول: {a['approved_topups_count']} — <code>{a['approved_topups_total']:.2f}</code> {html.escape(currency)}\n"
                 f"  Binance Pay: <code>{a['binance_topups_total']:.2f}</code> | InstaPay: <code>{a['instapay_topups_total']:.2f}</code>\n"
-                f"🏦 أرصدة المحافظ الحالية: <code>{a['total_user_balances']:.2f}</code> {html.escape(currency)}\n"
+                f"🏦 أرصدة المحافظ الحالية: <code>{db.fmt_money(a['total_user_balances'])}</code> {html.escape(currency)}\n"
                 f"📲 المخزون المتاح: {a['available_esims']} | 🔔 تنبيهات التوفر: {a['active_stock_alerts']}\n\n"
                 f"🏆 <b>أفضل الباقات:</b>\n{top}\n\n📥 <b>تصدير البيانات:</b>"
             )
@@ -1972,7 +2318,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if not target: return
             context.user_data["state"]="ADM_MANUAL_BAL_AMOUNT"
             context.user_data["temp"]={"target_id":uid}
-            text=f"💰 <b>تعديل رصيد العميل #{uid}</b>\nالرصيد الحالي: <code>{float(target['balance']):.2f}</code> {html.escape(currency)}\nأرسل مبلغ الإضافة أو الخصم (مثال: <code>20</code> أو <code>-5</code>)."
+            text=f"💰 <b>تعديل رصيد العميل #{uid}</b>\nالرصيد الحالي: <code>{db.fmt_money(target['balance'])}</code> {html.escape(currency)}\nأرسل مبلغ الإضافة أو الخصم (مثال: <code>20</code> أو <code>-5</code>)."
             await safe_edit_or_send(update,text,InlineKeyboardMarkup([[IKB("🔙 إلغاء",callback_data=f"adm_user_view:{uid}")]]))
             return
 
@@ -2055,6 +2401,83 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         # ---------------- ADMIN: PUBLIC BROADCAST ----------------
+        if data.startswith("adm_users_list:"):
+            await q.answer()
+            try:
+                page = max(0, int(data.split(":")[1]))
+            except (IndexError, ValueError):
+                page = 0
+            per_page = 10
+            total_users = db.count_users()
+            users_page = db.list_users_by_balance(offset=page * per_page, limit=per_page)
+            text = (
+                "📋 <b>قائمة المستخدمين (مرتبون حسب الرصيد)</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 إجمالي المستخدمين: {total_users} | صفحة {page + 1}\n\n"
+                "اختر مستخدماً لعرض رصيده ومشترياته كاملة:"
+            )
+            rows = []
+            for u in users_page:
+                name = u.get("full_name") or (f"@{u['username']}" if u.get("username") else str(u["user_id"]))
+                mark = "🚫 " if u.get("is_banned") else ""
+                label = (
+                    f"{mark}{name} — {db.fmt_money(u.get('balance') or 0)} {currency} "
+                    f"({u.get('purchases_count') or 0} شريحة)"
+                )
+                if len(label) > 60:
+                    label = label[:57] + "..."
+                rows.append([IKB(label, callback_data=f"adm_user_view:{u['user_id']}")])
+            nav = []
+            if page > 0:
+                nav.append(IKB("⬅️ السابق", callback_data=f"adm_users_list:{page - 1}"))
+            if (page + 1) * per_page < total_users:
+                nav.append(IKB("➡️ التالي", callback_data=f"adm_users_list:{page + 1}"))
+            if nav:
+                rows.append(nav)
+            rows.append([IKB("🔙 لوحة تحكم الأدمن", callback_data="adm_home")])
+            await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
+            return
+
+        if data == "adm_discounts" or data.startswith("adm_discount_off:"):
+            if data.startswith("adm_discount_off:"):
+                code_off = data.split(":", 1)[1]
+                db.deactivate_discount_code(code_off)
+                await q.answer(f"⛔ تم إيقاف الكود {code_off}.")
+            else:
+                await q.answer()
+            codes = db.list_discount_codes()
+            text = "🎟 <b>أكواد الخصم</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+            rows = []
+            if not codes:
+                text += "لا توجد أكواد خصم بعد."
+            for dc in codes:
+                uses = str(dc["used_count"]) + (f"/{dc['max_uses']}" if dc["max_uses"] else "")
+                status = "✅" if dc["active"] else "⛔"
+                text += (
+                    f"\n{status} <code>{html.escape(dc['code'])}</code> — خصم "
+                    f"{float(dc['percent']):g}% (استُخدم {uses})"
+                )
+                if dc["active"]:
+                    rows.append([IKB(f"🗑 إيقاف {dc['code']}", callback_data=f"adm_discount_off:{dc['code']}", style="danger")])
+            rows.append([IKB("➕ إضافة كود جديد", callback_data="adm_discount_add", style="success")])
+            rows.append([IKB("🔙 لوحة تحكم الأدمن", callback_data="adm_home")])
+            await safe_edit_or_send(update, text, InlineKeyboardMarkup(rows))
+            return
+
+        if data == "adm_discount_add":
+            await q.answer()
+            context.user_data["state"] = "ADM_DISCOUNT_ADD"
+            context.user_data["temp"] = {}
+            text = (
+                "➕ <b>إضافة كود خصم جديد</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "أرسل الكود ونسبة الخصم (والحد الأقصى للاستخدام اختيارياً) بالصيغة:\n"
+                "<code>SAVE10 15</code> أو <code>SAVE10 15 100</code>\n\n"
+                "الكود: حروف إنجليزية وأرقام فقط (2-20 خانة)."
+            )
+            await safe_edit_or_send(update, text, InlineKeyboardMarkup([[IKB("🔙 إلغاء", callback_data="adm_discounts")]]))
+            return
+
         if data == "adm_broadcast_start":
             await q.answer()
             context.user_data["state"] = "ADM_BROADCAST_MSG"
@@ -2065,6 +2488,45 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             kb = InlineKeyboardMarkup([[IKB("🔙 إلغاء", callback_data="adm_home")]])
             await safe_edit_or_send(update, text, kb)
+            return
+
+        if data == "adm_broadcast_cancel":
+            await q.answer("❌ تم إلغاء الرسالة الجماعية.")
+            temp.pop("bc_from_chat", None)
+            temp.pop("bc_msg_id", None)
+            await safe_edit_or_send(update, "❌ تم إلغاء الرسالة الجماعية — لم يتم إرسال أي شيء.", InlineKeyboardMarkup([[IKB("🔙 لوحة تحكم الأدمن", callback_data="adm_home")]]))
+            return
+
+        if data == "adm_broadcast_confirm":
+            from_chat = temp.pop("bc_from_chat", None)
+            bc_id = temp.pop("bc_msg_id", None)
+            if not from_chat or not bc_id:
+                await q.answer("⚠️ انتهت صلاحية الطلب — أعد إرسال الرسالة.", show_alert=True)
+                return
+            await q.answer()
+            users = db.get_all_active_users()
+            progress = await q.message.reply_text(f"📢 جاري إرسال الرسالة الجماعية إلى {len(users)} مستخدم...")
+            sent = 0
+            failed = 0
+            for u in users:
+                try:
+                    await _send_with_flood_retry(lambda uid=u["user_id"]: context.bot.copy_message(
+                        chat_id=uid,
+                        from_chat_id=from_chat,
+                        message_id=bc_id,
+                    ))
+                    sent += 1
+                    await asyncio.sleep(0.04)
+                except (Forbidden, BadRequest, TelegramError):
+                    failed += 1
+            await progress.edit_text(
+                f"✅ <b>اكتمل إرسال الرسالة الجماعية!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"📨 <b>تم الإرسال بنجاح إلى:</b> {sent} مستخدم\n"
+                f"⚠️ <b>فشل / قاموا بحظر البوت:</b> {failed} مستخدم",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[IKB("🔙 لوحة تحكم الأدمن", callback_data="adm_home")]]),
+            )
             return
 
         # ---------------- ADMIN: SETTINGS (BINANCE / INSTAPAY / SUPPORT) ----------------
@@ -2119,6 +2581,78 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ==============================================================================
 # Message Handler (Text & Photos for User Top-Ups & Admin Flows)
 # ==============================================================================
+async def relay_customer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    user = update.effective_user
+    try:
+        header = await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "📩 <b>رسالة جديدة من عميل</b>\n"
+                f"👤 {html.escape(user.full_name or 'بدون اسم')}"
+                + (f" (@{user.username})" if user.username else "")
+                + f"\n🆔 <code>{user.id}</code>\n\n"
+                "↩️ للرد على العميل: اضغط «رد» على الرسالة المحوّلة أدناه ثم اكتب ردك."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        copied = await context.bot.copy_message(
+            chat_id=ADMIN_ID, from_chat_id=msg.chat_id, message_id=msg.message_id
+        )
+        db.record_relay_message(header.message_id, user.id)
+        db.record_relay_message(copied.message_id, user.id)
+        await msg.reply_text("📩 وصلت رسالتك لفريق الدعم وسيتم الرد عليك في أقرب وقت.")
+    except Exception as exc:
+        logger.warning("relay to admin failed: %s", exc)
+
+
+async def handle_admin_relay_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    if not msg or not msg.reply_to_message:
+        return
+    customer_id = db.get_relay_customer(msg.reply_to_message.message_id)
+    if not customer_id:
+        await msg.reply_text("⚠️ لم يتم التعرف على العميل. اضغط «رد» على رسالة محوّلة من عميل ليتم إرسال ردك له.")
+        return
+    try:
+        await context.bot.send_message(chat_id=customer_id, text="💬 <b>رد من الدعم:</b>", parse_mode=ParseMode.HTML)
+        await context.bot.copy_message(chat_id=customer_id, from_chat_id=msg.chat_id, message_id=msg.message_id)
+        await msg.reply_text("✅ تم إرسال ردك إلى العميل.")
+    except (Forbidden, BadRequest):
+        await msg.reply_text("⚠️ تعذر إرسال الرد — العميل قد يكون حظر البوت.")
+
+
+async def mirror_to_owner(update: Update, context: ContextTypes.DEFAULT_TYPE, label: str) -> None:
+    """Copy customer activity (commands, menu presses, flow inputs, payment images) to the owner.
+    Notification only: never changes the customer's flow."""
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user or is_admin(user.id):
+        return
+    try:
+        header = await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"🔔 <b>{html.escape(label)}</b>\n"
+                f"👤 {html.escape(user.full_name or 'بدون اسم')}"
+                + (f" (@{user.username})" if user.username else "")
+                + f"\n🆔 <code>{user.id}</code>"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        db.record_relay_message(header.message_id, user.id)
+        if not (msg.text and msg.text.startswith("/")):
+            copied = await context.bot.copy_message(
+                chat_id=ADMIN_ID, from_chat_id=msg.chat_id, message_id=msg.message_id
+            )
+            db.record_relay_message(copied.message_id, user.id)
+        else:
+            body = await context.bot.send_message(chat_id=ADMIN_ID, text=msg.text[:500])
+            db.record_relay_message(body.message_id, user.id)
+    except Exception as exc:
+        logger.warning("mirror to admin failed: %s", exc)
+
+
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await check_ban_guard(update):
         return
@@ -2137,6 +2671,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if msg.text:
         menu_action = match_reply_menu_action(msg.text, exact_only=bool(state))
         if menu_action:
+            await mirror_to_owner(update, context, "ضغط زر قائمة من عميل")
             clear_state(context)
             if menu_action == "adm_home" and not is_admin(user.id):
                 await show_home(update, context)
@@ -2144,14 +2679,336 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await route_reply_menu(update, context, menu_action)
             return
 
-    # If no active state, show main menu
+    # If no active state: relay customer messages to the owner (owner replies by
+    # replying to the relayed message), then show main menu.
     if not state:
+        if is_admin(user.id):
+            await handle_admin_relay_reply(update, context)
+        else:
+            await relay_customer_message(update, context)
         await show_home(update, context)
+        return
+
+
+    # --------------------------------------------------------------------------
+    # USER: DISCOUNT CODE ENTRY
+    # --------------------------------------------------------------------------
+    if state == "USER_DISCOUNT_CODE":
+        if not msg.text:
+            await msg.reply_text("أرسل كود الخصم كنص.")
+            return
+        plan_id = int(temp.get("plan_id") or 0)
+        qty = int(temp.get("qty") or 1)
+        code_in = msg.text.strip().upper()
+        dc = db.get_discount_code(code_in)
+        clear_state(context)
+        if not dc:
+            await msg.reply_text("⚠️ كود الخصم غير صالح أو منتهي.")
+            await render_user_plan_view(update, context, user, plan_id, qty=qty)
+            return
+        context.user_data.setdefault("temp", {})["discount_code"] = code_in
+        await msg.reply_text(
+            f"✅ تم تطبيق كود الخصم <b>{html.escape(code_in)}</b> بنسبة {float(dc['percent']):g}%.",
+            parse_mode=ParseMode.HTML,
+        )
+        await render_user_plan_view(update, context, user, plan_id, qty=qty)
         return
 
     # --------------------------------------------------------------------------
     # USER TOP-UP STATES
     # --------------------------------------------------------------------------
+    if state == "USER_TOPUP_AUTO_AMOUNT":
+        if not msg.text:
+            await msg.reply_text("⚠️ يرجى إرسال قيمة المبلغ كأرقام فقط (مثال: 15).")
+            return
+        try:
+            amount_dec = Decimal(msg.text.strip().replace(",", ".")).quantize(Decimal("0.01"))
+            if amount_dec <= 0:
+                raise ValueError()
+        except (InvalidOperation, ValueError):
+            await msg.reply_text("⚠️ قيمة غير صحيحة! يرجى إدخال رقم أكبر من صفر (مثال: <code>10</code>).", parse_mode=ParseMode.HTML)
+            return
+        amount = float(amount_dec)
+
+        current_mode = bp.mode()
+        if current_mode not in ("monitor", "merchant"):
+            clear_state(context)
+            await msg.reply_text(
+                "⚠️ الشحن التلقائي غير متاح حالياً. استخدم وسيلة الدفع اليدوية من قائمة «💳 شحن الرصيد».",
+                reply_markup=InlineKeyboardMarkup([[IKB("💳 وسائل الدفع", callback_data="u_topup")]]),
+            )
+            return
+
+        clear_state(context)
+        wait_msg = await msg.reply_text("⏳ جاري تجهيز فاتورة الدفع لدى Binance Pay...")
+        order_id, trade_no = db.create_binance_pay_order(user.id, amount, bp.order_currency())
+        try:
+            resp = await bp.create_order(trade_no, amount, f"eSIM Store TopUp {trade_no}")
+        except Exception as exc:
+            logger.error("Binance Pay create_order failed: %s", exc)
+            resp = {}
+
+        checkout_url = ""
+        if isinstance(resp, dict) and resp.get("status") == "SUCCESS":
+            data_obj = resp.get("data") or {}
+            checkout_url = data_obj.get("checkoutUrl") or data_obj.get("universalUrl") or data_obj.get("qrcodeLink") or ""
+            db.set_binance_pay_order_created(order_id, data_obj.get("prepayId") or "", checkout_url)
+
+        if not checkout_url:
+            db.set_binance_pay_order_failed(order_id)
+            err_code = resp.get("code", "") if isinstance(resp, dict) else ""
+            err_msg = resp.get("errorMessage", "") if isinstance(resp, dict) else ""
+            logger.error("Binance Pay order creation error: %s %s", err_code, err_msg)
+            await wait_msg.edit_text(
+                "❌ <b>تعذر إنشاء فاتورة الدفع حالياً.</b>\n"
+                "يرجى المحاولة مرة أخرى بعد قليل أو استخدام وسيلة دفع أخرى.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[IKB("💳 وسائل الدفع", callback_data="u_topup")]]),
+            )
+            if ADMIN_ID:
+                try:
+                    await context.bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=(
+                            "⚠️ <b>فشل إنشاء فاتورة Binance Pay</b>\n"
+                            f"🆔 العميل: <code>{user.id}</code> | المبلغ: <code>{amount:.2f}</code>\n"
+                            f"الخطأ: <code>{html.escape(str(err_code))} {html.escape(str(err_msg))[:200]}</code>"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError:
+                    pass
+            return
+
+        await wait_msg.edit_text(
+            f"⚡ <b>فاتورة شحن رصيد بقيمة <code>{amount:.2f}</code> {html.escape(currency)}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🧾 <b>رقم العملية:</b> <code>{trade_no}</code>\n\n"
+            "اضغط زر <b>«ادفع الآن»</b> بالأسفل وأكمل الدفع من تطبيق Binance.\n"
+            "✅ فور إتمام الدفع سيُضاف الرصيد إلى حسابك <b>تلقائياً</b> ويصلك إشعار.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [IKB("🟡 ادفع الآن عبر Binance Pay", url=checkout_url)],
+                [IKB("🏠 القائمة الرئيسية", callback_data="home")],
+            ]),
+        )
+        return
+
+    if state == "USER_TOPUP_AUTO_PROOF":
+        file_obj = None
+        if msg.photo:
+            file_obj = msg.photo[-1]
+        elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image/"):
+            file_obj = msg.document
+        if file_obj is None:
+            await msg.reply_text(
+                "📸 أرسل <b>صورة إيصال التحويل</b> (السكرين اللي فيه Order ID) هنا كصورة.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        wait_msg = await msg.reply_text("⏳ جاري قراءة الإيصال والتحقق من التحويل في سجل Binance Pay...")
+        try:
+            tg_file = await file_obj.get_file()
+            image_bytes = bytes(await tg_file.download_as_bytearray())
+        except Exception as exc:
+            logger.error("فشل تحميل صورة إيصال الشحن التلقائي: %s", exc)
+            clear_state(context)
+            await wait_msg.edit_text(
+                "❌ <b>تعذر تحميل الصورة.</b> حاول إرسالها مرة أخرى.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[IKB("💳 وسائل الدفع", callback_data="u_topup")]]),
+            )
+            return
+
+        try:
+            order_ids = await bp.ocr_space_extract_order_ids(image_bytes)
+        except Exception as exc:
+            clear_state(context)
+            if str(exc) == "ocr_not_configured":
+                logger.error("OCR.space غير مكوّن: تعذر قراءة إيصال شحن تلقائي")
+                await wait_msg.edit_text(
+                    "❌ <b>خدمة قراءة الإيصالات غير متاحة حالياً.</b>\n"
+                    "استخدم وسيلة الدفع اليدوية من قائمة «💳 شحن الرصيد» وسيُضاف رصيدك بعد المراجعة.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[IKB("💳 وسائل الدفع", callback_data="u_topup")]]),
+                )
+                if ADMIN_ID:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=ADMIN_ID,
+                            text=(
+                                "⚠️ <b>محاولة شحن تلقائي وخدمة OCR غير مكوّنة</b>\n"
+                                f"🆔 العميل: <code>{user.id}</code>"
+                            ),
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except TelegramError:
+                        pass
+            else:
+                logger.error("فشل OCR.space: %s", exc)
+                await wait_msg.edit_text(
+                    "❌ <b>تعذر قراءة الصورة حالياً.</b> حاول مرة أخرى بعد قليل.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[IKB("💳 وسائل الدفع", callback_data="u_topup")]]),
+                )
+            return
+
+        if not order_ids:
+            await wait_msg.edit_text(
+                "❌ <b>لم نتمكن من قراءة رقم الطلب (Order ID) من الصورة.</b>\n"
+                "أرسل صورة أوضح لإيصال التحويل يظهر فيها Order ID كاملاً.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        cutoff_ms = int(db.get_setting("auto_topup_cutoff_ms", "0") or 0)
+        matches: Dict[str, Any] = {}
+        ambiguous = False
+        try:
+            for cand in order_ids:
+                tx, amb = await bp.find_pay_transaction(cand, min_time_ms=cutoff_ms)
+                if amb:
+                    ambiguous = True
+                    break
+                if tx:
+                    matches[str(tx.get("transactionId") or "")] = tx
+        except Exception as exc:
+            logger.error("فشل الاتصال بواجهة Binance: %s", exc)
+            clear_state(context)
+            await wait_msg.edit_text(
+                "❌ <b>تعذر التحقق من العملية حالياً بسبب مشكلة اتصال.</b>\n"
+                "حاول مرة أخرى بعد دقيقة، أو استخدم وسيلة الدفع اليدوية.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[IKB("💳 وسائل الدفع", callback_data="u_topup")]]),
+            )
+            return
+
+        if ambiguous or len(matches) > 1:
+            clear_state(context)
+            await wait_msg.edit_text(
+                "❌ <b>رقم الطلب في الصورة يطابق أكثر من عملية.</b>\n"
+                "تواصل مع الدعم وسيتم إضافة رصيدك بعد المراجعة.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[IKB("💳 وسائل الدفع", callback_data="u_topup")]]),
+            )
+            if ADMIN_ID:
+                try:
+                    await context.bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=(
+                            "🚫 <b>شحن تلقائي مرفوض: تطابق غير فريد</b>\n"
+                            f"🆔 العميل: <code>{user.id}</code>\n"
+                            f"🔢 أرقام مقروءة: <code>{html.escape(', '.join(order_ids))}</code>"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError:
+                    pass
+            return
+
+        if not matches:
+            clear_state(context)
+            await wait_msg.edit_text(
+                "❌ <b>لم يتم العثور على تحويل وارد يطابق رقم الطلب في الصورة.</b>\n"
+                "تأكد أن التحويل تم فعلاً إلى حساب المتجر، وأن الصورة لإيصال التحويل نفسه، ثم حاول مرة أخرى.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[IKB("💳 محاولة جديدة", callback_data="u_topup")]]),
+            )
+            if ADMIN_ID:
+                try:
+                    await context.bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=(
+                            "🚫 <b>شحن تلقائي مرفوض: لا توجد عملية مطابقة</b>\n"
+                            f"🆔 العميل: <code>{user.id}</code>\n"
+                            f"🔢 أرقام مقروءة: <code>{html.escape(', '.join(order_ids))}</code>"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError:
+                    pass
+            return
+
+        tx = next(iter(matches.values()))
+        valid, reason, tx_amount, tx_currency, payer_name = bp.validate_topup_transaction(tx, min_time_ms=cutoff_ms)
+        if not valid:
+            clear_state(context)
+            if reason == "already_used":
+                reject_text = "❌ <b>رقم العملية هذا تم استخدامه من قبل</b> وأُضيف رصيده سابقاً. لا يمكن استخدام نفس التحويل مرتين."
+            elif reason == "outgoing":
+                reject_text = "❌ <b>هذه عملية صادرة وليست تحويلاً وارداً</b> إلى حساب المتجر."
+            elif reason == "wrong_type":
+                reject_text = "❌ <b>نوع العملية غير مقبول.</b> يُقبل فقط التحويل المباشر (C2C) من حساب Binance آخر."
+            elif reason == "too_old":
+                reject_text = "❌ <b>هذا التحويل قديم.</b> يُقبل فقط التحويل الذي تم خلال الساعة الأخيرة. لو التحويل حصل من أكثر من ساعة، تواصل مع الدعم."
+            elif reason == "wrong_currency":
+                reject_text = (
+                    f"❌ <b>عملة التحويل {html.escape(tx_currency)} غير مقبولة.</b> "
+                    f"يجب التحويل بعملة <b>{html.escape(bp.order_currency())}</b> فقط."
+                )
+            else:
+                reject_text = "❌ <b>لم يتم العثور على تحويل وارد يطابق رقم الطلب في الصورة.</b>"
+            await wait_msg.edit_text(
+                reject_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[IKB("💳 محاولة جديدة", callback_data="u_topup")]]),
+            )
+            if ADMIN_ID:
+                try:
+                    await context.bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=(
+                            "🚫 <b>محاولة شحن تلقائي مرفوضة</b>\n"
+                            f"🆔 العميل: <code>{user.id}</code> | السبب: <code>{reason}</code>\n"
+                            f"🧾 رقم العملية: <code>{html.escape(str(tx.get('transactionId') or ''))}</code>"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError:
+                    pass
+            return
+
+        canonical_id = str(tx.get("transactionId") or "")
+        ok, status, result = db.credit_topup_from_transaction(user.id, canonical_id, tx_amount, tx_currency, payer_name)
+        clear_state(context)
+        if not ok:
+            await wait_msg.edit_text(
+                "❌ <b>رقم العملية هذا تم استخدامه من قبل.</b> لا يمكن استخدام نفس التحويل مرتين.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[IKB("💳 وسائل الدفع", callback_data="u_topup")]]),
+            )
+            return
+
+        new_balance = result["new_balance"]
+        await wait_msg.edit_text(
+            "🎉 <b>تم التحقق من التحويل وشحن رصيدك بنجاح!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"💵 <b>المبلغ المضاف:</b> <code>{db.fmt_money(tx_amount)}</code> {html.escape(currency)}\n"
+            f"💰 <b>رصيدك الحالي:</b> <code>{db.fmt_money(new_balance)}</code> {html.escape(currency)}\n"
+            f"🧾 <b>رقم العملية:</b> <code>{html.escape(canonical_id)}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[IKB("🏠 القائمة الرئيسية", callback_data="home")]]),
+        )
+        if ADMIN_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        "⚡ <b>شحن تلقائي ناجح عبر Binance Pay</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"👤 <b>العميل:</b> {html.escape(user.full_name or '')} (@{html.escape(user.username or NO_USER)})\n"
+                        f"🆔 <b>معرف العميل:</b> <code>{user.id}</code>\n"
+                        f"💵 <b>المبلغ:</b> <code>{db.fmt_money(tx_amount)}</code> {html.escape(currency)}\n"
+                        f"🧾 <b>رقم العملية:</b> <code>{html.escape(canonical_id)}</code>\n"
+                        f"👤 <b>اسم المرسل:</b> {html.escape(payer_name or 'غير متاح')}"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass
+        return
+
     if state == "USER_TOPUP_AMOUNT":
         if not msg.text:
             await msg.reply_text("⚠️ يرجى إرسال قيمة المبلغ كأرقام فقط (مثال: 15).")
@@ -2500,15 +3357,81 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         added = skipped = 0
         if msg.photo or (msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image/")):
+            batch_id = temp.get("batch_id")
+            if temp.get("batch_closing") or not batch_id:
+                await msg.reply_text("⚠️ دفعة الإضافة اتقفلت بالفعل. افتح «إضافة شرائح» من الباقة لبدء دفعة جديدة.")
+                return
             file_id = msg.photo[-1].file_id if msg.photo else msg.document.file_id
+            fuid = (msg.photo[-1].file_unique_id if msg.photo else getattr(msg.document, "file_unique_id", "")) or ""
+            dup = db.find_esim_by_qr_unique(fuid)
+            if dup:
+                dplan = db.get_plan(int(dup["plan_id"]))
+                await msg.reply_text(
+                    f"⚠️ هذه الصورة مضافة مسبقاً كشريحة رقم {dup['id']}"
+                    + (f" في باقة «{html.escape(dplan['name'])}»" if dplan else "")
+                    + ". لم تتم إضافتها مرة أخرى."
+                )
+                return
             tg_file = await context.bot.get_file(file_id)
-            local_path = str(QR_DIR / f"qr_plan{plan_id}_{file_id[:12]}.png")
+            local_name = f"qr_plan{plan_id}_{fuid or file_id[-16:]}.png"
+            local_path = str(QR_DIR / local_name)
             await tg_file.download_to_drive(custom_path=local_path)
-            caption = (msg.caption or "").strip()
-            lpa = caption if caption.upper().startswith("LPA:") else ""
-            notes = "" if lpa else caption
-            db.add_esim(plan_id, "qr", lpa_code=lpa, qr_file_id=file_id, qr_local_path=local_path, notes=notes)
-            added = 1
+            # Serialize with Done under the same per-batch lock; recheck that this
+            # photo still belongs to the live batch (not closed / not replaced by
+            # a new batch for this or another plan) before inserting.
+            lock = context.bot_data.setdefault("esim_add_locks", {}).setdefault(batch_id, asyncio.Lock())
+            async with lock:
+                temp_now = context.user_data.get("temp", {})
+                batch_live = (
+                    context.user_data.get("state") == "ADM_ADD_ESIM"
+                    and temp_now.get("batch_id") == batch_id
+                    and not temp_now.get("batch_closing")
+                    and int(temp_now.get("plan_id") or 0) == plan_id
+                )
+                if not batch_live:
+                    new_esim_id = None
+                    rejected_closed = True
+                else:
+                    caption = (msg.caption or "").strip()
+                    lpa = caption if caption.upper().startswith("LPA:") else ""
+                    notes = "" if lpa else caption
+                    new_esim_id = db.add_esim(plan_id, "qr", lpa_code=lpa, qr_file_id=file_id, qr_local_path=local_path, notes=notes, qr_unique_id=fuid)
+                    rejected_closed = False
+                    if new_esim_id is not None:
+                        batch = int(temp_now.get("batch_added") or 0) + 1
+                        temp_now["batch_added"] = batch
+            if new_esim_id is None:
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+                if rejected_closed:
+                    await msg.reply_text("⚠️ دفعة الإضافة اتقفلت أو اتغيّرت أثناء الرفع. الصورة لم تُضف — افتح «إضافة شرائح» من الباقة وأعد إرسالها.")
+                else:
+                    await msg.reply_text("⚠️ هذه الصورة مضافة مسبقاً. لم تتم إضافتها مرة أخرى.")
+                return
+            # Stay in ADM_ADD_ESIM state so more photos / album items keep adding.
+            done_kb = InlineKeyboardMarkup([
+                [IKB("✅ إنهاء الإضافة", callback_data="adm_esim_add_done", style="success")],
+                [IKB("🔕 إنهاء بدون إشعارات", callback_data="adm_esim_add_done_silent")],
+            ])
+            progress_text = (
+                f"📥 تمت إضافة <b>{batch}</b> صورة QR حتى الآن إلى <b>{html.escape(plan['name'])}</b>.\n"
+                "أرسل المزيد من الصور الآن، أو اضغط إنهاء."
+            )
+            prog_id = temp.get("batch_progress_id")
+            if prog_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=msg.chat_id, message_id=prog_id,
+                        text=progress_text, parse_mode=ParseMode.HTML, reply_markup=done_kb,
+                    )
+                    return
+                except (BadRequest, TelegramError):
+                    pass
+            prog = await msg.reply_text(progress_text, parse_mode=ParseMode.HTML, reply_markup=done_kb)
+            context.user_data["temp"]["batch_progress_id"] = prog.message_id
+            return
         elif msg.text:
             codes = [line.strip() for line in msg.text.splitlines() if line.strip()]
             added, skipped = db.add_lpa_esims_bulk(plan_id, codes)
@@ -2603,7 +3526,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["state"] = "ADM_MANUAL_BAL_AMOUNT"
         await msg.reply_text(
             f"👤 <b>المستخدم:</b> <code>{target_id}</code> ({html.escape(target_user.get('full_name') or '')})\n"
-            f"💰 <b>رصيده الحالي:</b> <code>{float(target_user['balance']):.2f}</code> {html.escape(currency)}\n\n"
+            f"💰 <b>رصيده الحالي:</b> <code>{db.fmt_money(target_user['balance'])}</code> {html.escape(currency)}\n\n"
             "أرسل الآن <b>المبلغ المراد إضافته أو خصمه</b>:\n"
             "• لإضافة رصيد أرسل الرقم مباشرة (مثال: <code>20</code>)\n"
             "• لخصم رصيد ضع علامة سالب قبل الرقم (مثال: <code>-10</code>)",
@@ -2672,35 +3595,64 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # ADMIN: PUBLIC BROADCAST MESSAGE TO ALL USERS
     # --------------------------------------------------------------------------
     if state == "ADM_BROADCAST_MSG":
+        bc_chat = msg.chat_id
+        bc_id = msg.message_id
         clear_state(context)
+        context.user_data["temp"] = {"bc_from_chat": bc_chat, "bc_msg_id": bc_id}
         users = db.get_all_active_users()
-        progress = await msg.reply_text(f"📢 جاري إرسال الرسالة الجماعية إلى {len(users)} مستخدم...")
-        sent = 0
-        failed = 0
-        for u in users:
-            try:
-                await _send_with_flood_retry(lambda uid=u["user_id"]: context.bot.copy_message(
-                    chat_id=uid,
-                    from_chat_id=msg.chat_id,
-                    message_id=msg.message_id,
-                ))
-                sent += 1
-                await asyncio.sleep(0.04)
-            except (Forbidden, BadRequest, TelegramError):
-                failed += 1
-        await progress.edit_text(
-            f"✅ <b>اكتمل إرسال الرسالة الجماعية!</b>\n"
+        await msg.reply_text(
+            "📢 <b>تأكيد الرسالة الجماعية</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"📨 <b>تم الإرسال بنجاح إلى:</b> {sent} مستخدم\n"
-            f"⚠️ <b>فشل / قاموا بحظر البوت:</b> {failed} مستخدم",
+            f"سيتم إرسال رسالتك الأخيرة إلى <b>{len(users)}</b> مستخدم.\n"
+            "هل أنت متأكد من الإرسال؟",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[IKB("🔙 لوحة تحكم الأدمن", callback_data="adm_home")]]),
+            reply_markup=InlineKeyboardMarkup([[
+                IKB("✅ تأكيد الإرسال للجميع", callback_data="adm_broadcast_confirm", style="success"),
+                IKB("❌ إلغاء", callback_data="adm_broadcast_cancel", style="danger"),
+            ]]),
         )
         return
 
     # --------------------------------------------------------------------------
     # ADMIN: UPDATE SETTINGS
     # --------------------------------------------------------------------------
+    if state == "ADM_DISCOUNT_ADD":
+        if not msg.text:
+            return
+        parts = msg.text.strip().split()
+        if len(parts) < 2:
+            await msg.reply_text("⚠️ الصيغة: <code>الكود النسبة [الحد الأقصى]</code> — مثال <code>SAVE10 15</code>", parse_mode=ParseMode.HTML)
+            return
+        code_new = parts[0].upper()
+        if not re.fullmatch(r"[A-Z0-9]{2,20}", code_new):
+            await msg.reply_text("⚠️ الكود يجب أن يكون حروفاً إنجليزية وأرقاماً فقط (2-20 خانة).")
+            return
+        try:
+            pct = Decimal(parts[1])
+            if pct <= 0 or pct > 100:
+                raise ValueError()
+        except (InvalidOperation, ValueError):
+            await msg.reply_text("⚠️ نسبة الخصم يجب أن تكون رقماً بين 0 و 100.")
+            return
+        max_uses = None
+        if len(parts) > 2:
+            if not parts[2].isdigit() or int(parts[2]) < 1:
+                await msg.reply_text("⚠️ الحد الأقصى للاستخدام يجب أن يكون رقماً صحيحاً أكبر من صفر.")
+                return
+            max_uses = int(parts[2])
+        created = db.create_discount_code(code_new, pct, max_uses)
+        clear_state(context)
+        if created:
+            await msg.reply_text(
+                f"✅ تم إنشاء كود الخصم <code>{html.escape(code_new)}</code> بنسبة {pct:g}%"
+                + (f" (حد أقصى {max_uses} استخدام)." if max_uses else "."),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[IKB("🎟 أكواد الخصم", callback_data="adm_discounts")]]),
+            )
+        else:
+            await msg.reply_text("⚠️ هذا الكود موجود مسبقاً أو غير صالح.")
+        return
+
     if state == "ADM_SET_SETTING":
         if not msg.text:
             return
@@ -2762,14 +3714,14 @@ def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("خطأ: لم يتم ضبط BOT_TOKEN في ملف .env! قم بتشغيل ./install.sh أو تعديل ملف .env")
 
-    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+    app: Application = ApplicationBuilder().token(BOT_TOKEN).post_init(bp.post_init_hook).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_router))
 
     logger.info("✅ تم تشغيل بوت متجر شرائح eSIM بنجاح (يعمل على مدار الساعة 24/7)...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
