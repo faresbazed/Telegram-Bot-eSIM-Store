@@ -709,7 +709,7 @@ async def render_user_plan_view(update, context, user, plan_id: int, qty: int = 
     disc = db.get_discount_code(disc_code) if disc_code else None
     discount_amount = Decimal("0")
     if disc:
-        discount_amount = (total * float(disc["percent"]) / Decimal("100")).quantize(db.PRICE_QUANT)
+        discount_amount = (total * db.to_decimal(disc["percent"]) / Decimal("100")).quantize(db.PRICE_QUANT)
         total = (total - discount_amount).quantize(db.PRICE_QUANT)
     stock = f"✅ متوفر للاستلام الفوري ({available} شريحة)" if available else "❌ نفدت الكمية حالياً"
     desc = f"📝 <b>تفاصيل الباقة:</b>\n{html.escape(plan['description'])}\n\n" if plan.get("description") else ""
@@ -745,6 +745,7 @@ async def render_user_plan_view(update, context, user, plan_id: int, qty: int = 
         else:
             diff = total - balance
             text += f"\n\n⚠️ <b>رصيدك غير كافٍ لهذه الكمية. تحتاج إلى شحن <code>{diff:.2f}</code> {html.escape(currency)} إضافية.</b>"
+            rows.append([IKB("🎟 لديك كود خصم؟", callback_data=f"u_plan_discount:{plan_id}:{qty}")])
             rows.append([IKB("💳 شحن الرصيد الآن", callback_data="u_topup")])
     else:
         if db.has_stock_alert(user.id, plan_id):
@@ -1274,7 +1275,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             else []
         )
         kb = InlineKeyboardMarkup(auto_row + [
-            [IKB("🟡 الدفع عبر Binance ID (عملات رقمية)", callback_data="u_topup_m:binance")],
             [IKB("🟣 الدفع عبر InstaPay EG (إنستا باي)", callback_data="u_topup_m:instapay")],
             [IKB("📜 سجل طلبات الشحن السابقة", callback_data="u_topup_history:0")],
             [IKB("🏠 القائمة الرئيسية", callback_data="home")],
@@ -1318,8 +1318,21 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data.startswith("u_topup_m:"):
-        await q.answer()
         method = data.split(":")[1]
+        if method == "binance":
+            data = "u_topup_auto"
+            await q.answer()
+            clear_state(context)
+            context.user_data["temp"] = {"method": "binance_auto"}
+            context.user_data["state"] = "USER_TOPUP_AUTO_PROOF"
+            pay_target = db.get_setting("binance_id", "غير محدد")
+            await safe_edit_or_send(update,
+                "⚡ <b>شحن تلقائي عبر Binance Pay</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                f"حوّل USDT إلى Binance ID: <code>{html.escape(pay_target)}</code>\n"
+                "ثم ابعت صورة الإيصال خلال ساعة، والرصيد بيتضاف تلقائياً.",
+                InlineKeyboardMarkup([[IKB("🏠 القائمة الرئيسية", callback_data="home")]]))
+            return
+        await q.answer()
         context.user_data["state"] = "USER_TOPUP_AMOUNT"
         context.user_data["temp"] = {"method": method}
 
@@ -2089,6 +2102,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if approve:
                 req_check = db.get_topup_request(req_id)
                 if req_check and req_check["status"] == "pending" and (req_check.get("method") or "").strip().lower() == "binance":
+                    await q.answer("⚠️ القبول اليدوي لشحن Binance متوقف. الشحن تلقائي فقط.", show_alert=True)
+                    return
+                if False:
                     await q.answer("⏳ جاري التحقق من التحويل في سجل Binance...")
                     image_bytes = b""
                     if req_check.get("proof_file_id"):
