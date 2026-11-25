@@ -172,6 +172,21 @@ def init_db() -> None:
                 FOREIGN KEY (plan_id) REFERENCES plans(id) ON DELETE CASCADE
             );
 
+        CREATE TABLE IF NOT EXISTS topup_receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            method TEXT NOT NULL DEFAULT 'binance',
+            status TEXT NOT NULL DEFAULT 'failed',
+            reason TEXT DEFAULT '',
+            transaction_id TEXT DEFAULT '',
+            amount TEXT DEFAULT '',
+            currency TEXT DEFAULT '',
+            payer_name TEXT DEFAULT '',
+            new_balance TEXT DEFAULT '',
+            file_id TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS relay_messages (
             owner_message_id INTEGER PRIMARY KEY,
             customer_id INTEGER NOT NULL,
@@ -1786,3 +1801,87 @@ def count_users() -> int:
     with get_connection() as conn:
         row = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()
     return int(row["c"])
+
+
+# ---------------------------------------------------------------------------
+# Top-up receipt history (owner menu)
+# ---------------------------------------------------------------------------
+def log_topup_receipt(user_id: int, file_id: str, method: str = "binance") -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO topup_receipts (user_id, method, status, reason, file_id) VALUES (?, ?, 'failed', 'unverified', ?)",
+            (user_id, method, file_id or ""),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def finish_topup_receipt(rid, status: str, reason: str = "", transaction_id: str = "",
+                         amount="", currency: str = "", payer_name: str = "", new_balance="") -> None:
+    if not rid:
+        return
+    with get_connection() as conn:
+        conn.execute(
+            """UPDATE topup_receipts SET status=?, reason=?, transaction_id=?, amount=?, currency=?,
+               payer_name=?, new_balance=? WHERE id=?""",
+            (status, reason or "", transaction_id or "",
+             _money_str(to_decimal(amount)) if amount not in ("", None) else "",
+             currency or "", (payer_name or "")[:64],
+             _money_str(to_decimal(new_balance)) if new_balance not in ("", None) else "", rid),
+        )
+        conn.commit()
+
+
+_HISTORY_SQL = """
+SELECT * FROM (
+    SELECT 'r' AS src, r.id AS id, r.user_id AS user_id, r.method AS method, r.status AS status,
+           r.reason AS reason, r.transaction_id AS transaction_id, r.amount AS amount,
+           r.currency AS currency, r.payer_name AS payer_name, r.file_id AS file_id,
+           r.created_at AS created_at
+    FROM topup_receipts r
+    UNION ALL
+    SELECT 't', t.id, t.user_id, t.method,
+           CASE t.status WHEN 'approved' THEN 'credited' WHEN 'rejected' THEN 'rejected' ELSE 'pending' END,
+           '', COALESCE(t.proof_text, ''), CAST(t.amount AS TEXT), '', '',
+           COALESCE(t.proof_file_id, ''), t.created_at
+    FROM topup_requests t
+) h
+"""
+
+
+def list_topup_history(user_id: Optional[int] = None, limit: int = 8, offset: int = 0) -> Tuple[List[Dict[str, Any]], int]:
+    where = "WHERE h.user_id = ?" if user_id is not None else ""
+    params: List[Any] = [user_id] if user_id is not None else []
+    with get_connection() as conn:
+        total = conn.execute(f"SELECT COUNT(*) FROM ({_HISTORY_SQL}) h {where}", params).fetchone()[0]
+        rows = conn.execute(
+            f"""SELECT h.*, u.username, u.full_name FROM ({_HISTORY_SQL}) h
+                LEFT JOIN users u ON u.user_id = h.user_id {where}
+                ORDER BY h.created_at DESC, h.id DESC LIMIT ? OFFSET ?""",
+            params + [limit, offset],
+        ).fetchall()
+        return [dict(r) for r in rows], int(total)
+
+
+def get_topup_history_item(src: str, item_id: int) -> Optional[Dict[str, Any]]:
+    with get_connection() as conn:
+        row = conn.execute(
+            f"""SELECT h.*, u.username, u.full_name, u.balance FROM ({_HISTORY_SQL}) h
+                LEFT JOIN users u ON u.user_id = h.user_id WHERE h.src = ? AND h.id = ?""",
+            (src, item_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_topup_users(limit: int = 8, offset: int = 0) -> Tuple[List[Dict[str, Any]], int]:
+    with get_connection() as conn:
+        total = conn.execute(f"SELECT COUNT(DISTINCT user_id) FROM ({_HISTORY_SQL}) h").fetchone()[0]
+        rows = conn.execute(
+            f"""SELECT h.user_id AS user_id, u.username, u.full_name, COUNT(*) AS n,
+                       SUM(CASE WHEN h.status='credited' THEN 1 ELSE 0 END) AS credited_n,
+                       MAX(h.created_at) AS last_at
+                FROM ({_HISTORY_SQL}) h LEFT JOIN users u ON u.user_id = h.user_id
+                GROUP BY h.user_id ORDER BY last_at DESC LIMIT ? OFFSET ?""",
+            (limit, offset),
+        ).fetchall()
+        return [dict(r) for r in rows], int(total)

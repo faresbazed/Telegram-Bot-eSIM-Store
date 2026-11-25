@@ -676,11 +676,44 @@ async def show_admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             IKB("📢 رسالة جماعية للكل", callback_data="adm_broadcast_start"),
         ],
         [
+            IKB("🧾 سجل الشحن والإيصالات", callback_data="adm_rcpt_menu"),
+        ],
+        [
             IKB("⚙️ إعدادات الدفع والدعم", callback_data="adm_settings"),
         ],
         [IKB("🏠 العودة لواجهة المستخدم", callback_data="home")],
     ])
     await safe_edit_or_send(update, text, kb)
+
+
+def fmt_cairo(ts: str) -> str:
+    """UTC 'YYYY-MM-DD HH:MM:SS' -> Cairo local display."""
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import timezone
+        dt = datetime.strptime(str(ts)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return dt.astimezone(ZoneInfo("Africa/Cairo")).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(ts or "")
+
+
+RCPT_STATUS = {"credited": "✅ تم الشحن", "rejected": "🚫 مرفوض", "failed": "⚠️ لم يكتمل", "pending": "⏳ معلق"}
+RCPT_REASON = {
+    "already_used": "رقم العملية مستخدم من قبل", "outgoing": "عملية صادرة", "wrong_type": "نوع عملية غير مقبول",
+    "too_old": "تحويل قديم", "wrong_currency": "عملة غير مقبولة", "no_match": "لا توجد عملية مطابقة",
+    "ambiguous": "تطابق غير فريد", "no_order_id": "تعذر قراءة رقم الطلب", "unverified": "لم يكتمل التحقق",
+}
+
+
+def rcpt_method(m: str) -> str:
+    return "🟡 Binance Pay" if m == "binance" else "🟣 InstaPay"
+
+
+def rcpt_label(h: Dict[str, Any]) -> str:
+    name = (h.get("full_name") or h.get("username") or str(h.get("user_id")))
+    amt = f"{db.fmt_money(h['amount'])} " if h.get("amount") not in ("", None) else ""
+    s = f"{fmt_cairo(h['created_at'])} | {name} | {amt}{RCPT_STATUS.get(h['status'], '')[:1]}"
+    return s if len(s) <= 60 else s[:57] + "..."
 
 
 async def render_user_plan_view(update, context, user, plan_id: int, qty: int = 1) -> None:
@@ -1964,6 +1997,125 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
 
+        # ---------------- ADMIN: TOP-UP RECEIPT HISTORY ----------------
+        if data == "adm_rcpt_menu":
+            await q.answer()
+            clear_state(context)
+            _, total = db.list_topup_history(None, 1, 0)
+            _, utotal = db.list_topup_users(1, 0)
+            await safe_edit_or_send(
+                update,
+                "🧾 <b>سجل الشحن والإيصالات</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                f"إجمالي العمليات المسجلة: <b>{total}</b> | عملاء: <b>{utotal}</b>\n\n"
+                "اختر طريقة العرض:",
+                InlineKeyboardMarkup([
+                    [IKB("📅 كل العمليات حسب التاريخ", callback_data="adm_rcpt_list:0")],
+                    [IKB("👥 حسب العميل", callback_data="adm_rcpt_users:0")],
+                    [IKB("🔙 لوحة تحكم الأدمن", callback_data="adm_home")],
+                ]),
+            )
+            return
+
+        if data.startswith("adm_rcpt_list:") or data.startswith("adm_rcpt_user:"):
+            await q.answer()
+            parts = data.split(":")
+            if parts[0] == "adm_rcpt_user":
+                uid, page = int(parts[1]), int(parts[2])
+                base, back = f"adm_rcpt_user:{uid}:", "adm_rcpt_users:0"
+            else:
+                uid, page = None, int(parts[1])
+                base, back = "adm_rcpt_list:", "adm_rcpt_menu"
+            items, total = db.list_topup_history(uid, 8, page * 8)
+            title = "📅 <b>عمليات الشحن (الأحدث أولاً)</b>"
+            if uid is not None:
+                urow = db.get_user(uid) or {}
+                title = f"👤 <b>شحن {html.escape(urow.get('full_name') or str(uid))}</b> (<code>{uid}</code>)"
+            rows = [[IKB(rcpt_label(h), callback_data=f"adm_rcpt_view:{h['src']}:{h['id']}")] for h in items]
+            nav = []
+            if page > 0:
+                nav.append(IKB("⬅️ السابق", callback_data=f"{base}{page - 1}"))
+            if (page + 1) * 8 < total:
+                nav.append(IKB("➡️ التالي", callback_data=f"{base}{page + 1}"))
+            if nav:
+                rows.append(nav)
+            rows.append([IKB("🔙 رجوع", callback_data=back)])
+            await safe_edit_or_send(
+                update,
+                f"{title}\n━━━━━━━━━━━━━━━━━━━━\nالعدد: {total} (التوقيت: القاهرة)\n" + ("" if items else "لا توجد عمليات."),
+                InlineKeyboardMarkup(rows),
+            )
+            return
+
+        if data.startswith("adm_rcpt_users:"):
+            await q.answer()
+            page = int(data.split(":")[1])
+            users, total = db.list_topup_users(8, page * 8)
+            rows = []
+            for u in users:
+                name = u.get("full_name") or u.get("username") or str(u["user_id"])
+                label = f"{name} — {u['n']} عملية ({u['credited_n']} ناجحة) — {fmt_cairo(u['last_at'])[:10]}"
+                rows.append([IKB(label[:60], callback_data=f"adm_rcpt_user:{u['user_id']}:0")])
+            nav = []
+            if page > 0:
+                nav.append(IKB("⬅️ السابق", callback_data=f"adm_rcpt_users:{page - 1}"))
+            if (page + 1) * 8 < total:
+                nav.append(IKB("➡️ التالي", callback_data=f"adm_rcpt_users:{page + 1}"))
+            if nav:
+                rows.append(nav)
+            rows.append([IKB("🔙 رجوع", callback_data="adm_rcpt_menu")])
+            await safe_edit_or_send(
+                update,
+                "👥 <b>العملاء الذين شحنوا</b>\n━━━━━━━━━━━━━━━━━━━━\n" + ("" if users else "لا توجد عمليات."),
+                InlineKeyboardMarkup(rows),
+            )
+            return
+
+        if data.startswith("adm_rcpt_view:"):
+            await q.answer()
+            _, src, sid = data.split(":")
+            h = db.get_topup_history_item(src, int(sid))
+            if not h:
+                return
+            lines = [
+                "🧾 <b>تفاصيل عملية الشحن</b>",
+                "━━━━━━━━━━━━━━━━━━━━",
+                f"👤 <b>العميل:</b> {html.escape(h.get('full_name') or '')} (@{html.escape(h.get('username') or NO_USER)})",
+                f"🆔 <b>المعرف:</b> <code>{h['user_id']}</code>",
+                f"💳 <b>الوسيلة:</b> {rcpt_method(h['method'])}",
+                f"📌 <b>الحالة:</b> {RCPT_STATUS.get(h['status'], h['status'])}",
+            ]
+            if h.get("amount") not in ("", None):
+                lines.append(f"💵 <b>المبلغ:</b> <code>{db.fmt_money(h['amount'])}</code> {html.escape(h.get('currency') or currency)}")
+            if h.get("reason"):
+                lines.append(f"ℹ️ <b>السبب:</b> {html.escape(RCPT_REASON.get(h['reason'], h['reason']))}")
+            if src == "r" and h.get("transaction_id"):
+                lines.append(f"🧾 <b>رقم العملية:</b> <code>{html.escape(h['transaction_id'])}</code>")
+            if src == "t" and h.get("transaction_id"):
+                lines.append(f"📝 <b>بيانات التحويل:</b> {html.escape(h['transaction_id'])}")
+            if h.get("payer_name"):
+                lines.append(f"👤 <b>اسم المرسل:</b> {html.escape(h['payer_name'])}")
+            lines.append(f"🕒 <b>التاريخ:</b> {fmt_cairo(h['created_at'])}")
+            text = "\n".join(lines)
+            kb = InlineKeyboardMarkup([
+                [IKB("👤 كل عمليات هذا العميل", callback_data=f"adm_rcpt_user:{h['user_id']}:0")],
+                [IKB("🔙 السجل", callback_data="adm_rcpt_menu")],
+            ])
+            if h.get("file_id"):
+                try:
+                    await q.message.delete()
+                except TelegramError:
+                    pass
+                try:
+                    await context.bot.send_photo(chat_id=user.id, photo=h["file_id"], caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+                    return
+                except TelegramError as exc:
+                    logger.warning("تعذر عرض صورة الإيصال: %s", exc)
+                    text += "\n⚠️ تعذر تحميل صورة الإيصال."
+                await context.bot.send_message(chat_id=user.id, text=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+                return
+            await safe_edit_or_send(update, text, kb)
+            return
+
         # ---------------- ADMIN: TOP-UPS & BALANCE ----------------
         if data == "adm_topups_menu":
             await q.answer()
@@ -2837,6 +2989,29 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return
 
+        rid = 0
+        try:
+            rid = db.log_topup_receipt(user.id, file_obj.file_id, "binance")
+        except Exception as exc:
+            logger.error("تعذر تسجيل إيصال الشحن: %s", exc)
+        if ADMIN_ID:
+            try:
+                await context.bot.send_photo(
+                    chat_id=ADMIN_ID,
+                    photo=file_obj.file_id,
+                    caption=(
+                        "🧾 <b>إيصال شحن جديد من عميل</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"👤 <b>العميل:</b> {html.escape(user.full_name or '')} (@{html.escape(user.username or NO_USER)})\n"
+                        f"🆔 <b>المعرف:</b> <code>{user.id}</code>\n"
+                        "💳 <b>الوسيلة:</b> 🟡 Binance Pay (تلقائي)\n"
+                        f"🕒 {fmt_cairo(datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'))}\n"
+                        "⏳ جاري التحقق التلقائي، وستصلك النتيجة."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError as exc:
+                logger.warning("تعذر إرسال الإيصال للمالك: %s", exc)
         try:
             order_ids = await bp.ocr_space_extract_order_ids(image_bytes)
         except Exception as exc:
@@ -2871,6 +3046,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         if not order_ids:
+            db.finish_topup_receipt(rid, "failed", "no_order_id")
             await wait_msg.edit_text(
                 "❌ <b>لم نتمكن من قراءة رقم الطلب (Order ID) من الصورة.</b>\n"
                 "أرسل صورة أوضح لإيصال التحويل يظهر فيها Order ID كاملاً.",
@@ -2901,6 +3077,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         if ambiguous or len(matches) > 1:
+            db.finish_topup_receipt(rid, "rejected", "ambiguous")
             clear_state(context)
             await wait_msg.edit_text(
                 "❌ <b>رقم الطلب في الصورة يطابق أكثر من عملية.</b>\n"
@@ -2924,6 +3101,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         if not matches:
+            db.finish_topup_receipt(rid, "rejected", "no_match")
             clear_state(context)
             await wait_msg.edit_text(
                 "❌ <b>لم يتم العثور على تحويل وارد يطابق رقم الطلب في الصورة.</b>\n"
@@ -2949,6 +3127,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         tx = next(iter(matches.values()))
         valid, reason, tx_amount, tx_currency, payer_name = bp.validate_topup_transaction(tx, min_time_ms=cutoff_ms)
         if not valid:
+            db.finish_topup_receipt(rid, "rejected", str(reason), str(tx.get("transactionId") or ""), tx_amount if tx_amount is not None else "", tx_currency, payer_name)
             clear_state(context)
             if reason == "already_used":
                 reject_text = "❌ <b>رقم العملية هذا تم استخدامه من قبل</b> وأُضيف رصيده سابقاً. لا يمكن استخدام نفس التحويل مرتين."
@@ -2997,6 +3176,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         new_balance = result["new_balance"]
+        db.finish_topup_receipt(rid, "credited", "", canonical_id, tx_amount, tx_currency, payer_name, new_balance)
         await wait_msg.edit_text(
             "🎉 <b>تم التحقق من التحويل وشحن رصيدك بنجاح!</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
